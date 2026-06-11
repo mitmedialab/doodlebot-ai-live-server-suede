@@ -1,0 +1,106 @@
+name: Initialize
+#
+# Lives on `main`. Run once, manually, right after creating a repo from the
+# dependency template. In order:
+#   1. On `release`: clone the `core` dependency into .suede/core and push
+#      (scripts/actions/init-release-core.sh).
+#   2. On `main`: clone the `core` dependency into .suede/core, install
+#      devcontainers-suede, link .devcontainer/devcontainer.json, then commit +
+#      push (scripts/actions/init-main-core-devcontainers.sh).
+#   3. Connect main's ./release folder to the repo's own `release` branch via
+#      git-subrepo, then publish main (scripts/actions/init-release-subrepo.sh).
+# core/devcontainers are subrepo-cloned at init time (rather than baked into the
+# template) so their .gitrepo links point at real commits. The hosted scripts
+# are unit-tested; README population and self-deletion stay here in the action.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Set this to your canonical scripts host (see note in suede-downstream-to-main.yml).
+  SUEDE_SCRIPTS: https://raw.githubusercontent.com/pmalacho-mit/suede/refs/heads/main/scripts
+
+jobs:
+  install-release-subrepo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install git-subrepo
+        shell: bash
+        run: |
+          git clone https://github.com/ingydotnet/git-subrepo ~/.git-subrepo
+          echo "$HOME/.git-subrepo/lib" >> "$GITHUB_PATH"
+
+      - name: Check git-subrepo installation
+        shell: bash
+        run: git subrepo --version
+
+      - name: Configure git identity for commits
+        shell: bash
+        run: |
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+
+      - name: Clone core dependency into .suede/core on the release branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin release
+          git checkout -B release origin/release
+          bash -c "$(curl -fsSL "$SUEDE_SCRIPTS/actions/init-release-core.sh")"
+
+      - name: Clone core + install devcontainers on the main branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout main
+          bash -c "$(curl -fsSL "$SUEDE_SCRIPTS/actions/init-main-core-devcontainers.sh")"
+
+      - name: Connect ./release to the release branch
+        shell: bash
+        run: bash -c "$(curl -fsSL "$SUEDE_SCRIPTS/actions/init-release-subrepo.sh")"
+
+      - name: Populate README with installation details
+        shell: bash
+        run: |
+          bash -c "$(curl -fsSL "$SUEDE_SCRIPTS/populate/readme-after-init.sh")"
+
+      - name: Commit and push updated README
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "$(git status --porcelain README.md)" ]]; then
+            git add README.md
+            git commit -m "chore(suede-init): update README after initialization"
+            git push
+          else
+            echo "No changes to README.md to commit."
+          fi
+
+      - name: Delete initialize action (aka this file)
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILE=".github/workflows/initialize.yml"
+
+          if [[ -f "$FILE" ]]; then
+            echo "Removing $FILE..."
+            git rm -f "$FILE"
+
+            # Commit and push if there are staged changes
+            if [[ -n "$(git status --porcelain)" ]]; then
+              git commit -m "chore(suede-init): remove initialization workflow"
+              git push
+            else
+              echo "No changes to commit after removing $FILE."
+            fi
+          else
+            echo "File $FILE not found; nothing to delete."
+          fi
