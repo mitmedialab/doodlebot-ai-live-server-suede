@@ -81,6 +81,11 @@ class Broadcast:
         phones: list[Phone]
 
 
+LISTENER_QUEUE_MAXSIZE = 50
+"""
+Max messages buffered per client before we consider it too slow and drop it.
+"""
+
 _listeners: list[queue.Queue[str]] = []
 _listeners_lock = threading.Lock()
 
@@ -103,25 +108,25 @@ def broadcast(event: BroadcastEvent, data: BaseModel) -> None:
     msg = f"event: {event}\ndata: {data.model_dump_json()}\n\n"
     with _listeners_lock:
         dead = []
-        for q in _listeners:
+        for message_queue in _listeners:
             try:
-                q.put_nowait(msg)
+                message_queue.put_nowait(msg)
             except queue.Full:
-                dead.append(q)
-        for q in dead:
-            _listeners.remove(q)
+                dead.append(message_queue)
+        for message_queue in dead:
+            _listeners.remove(message_queue)
 
 
 def add_listener() -> queue.Queue[str]:
-    q: queue.Queue[str] = queue.Queue(maxsize=50)
+    message_queue: queue.Queue[str] = queue.Queue(maxsize=LISTENER_QUEUE_MAXSIZE)
     with _listeners_lock:
-        _listeners.append(q)
-    return q
+        _listeners.append(message_queue)
+    return message_queue
 
 
-def remove_listener(q: queue.Queue[str]) -> None:
+def remove_listener(message_queue: queue.Queue[str]) -> None:
     with _listeners_lock:
         try:
-            _listeners.remove(q)
+            _listeners.remove(message_queue)
         except ValueError:
             pass

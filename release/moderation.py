@@ -33,12 +33,12 @@ class Pending:
 async def list_pending(request: Request) -> list[Pending.Item]:
     require_admin(request)
     items: list[Pending.Item] = []
-    for p in sorted(PENDING_DIR.glob("*.png"), reverse=True):
-        meta_path = p.with_suffix(".json")
+    for path in sorted(PENDING_DIR.glob("*.png"), reverse=True):
+        meta_path = path.with_suffix(".json")
         meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
         if meta.get("status") != "pending":
             continue
-        with open(p, "rb") as f:
+        with open(path, "rb") as f:
             b64 = base64.b64encode(f.read()).decode()
         items.append(Pending.Item(**meta, dataUrl=f"data:image/png;base64,{b64}"))
     return items
