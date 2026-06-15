@@ -31,14 +31,14 @@ class Sketches:
 @router.get("/api/sketches")
 async def list_sketches() -> list[Sketches.Item]:
     sketches: list[Sketches.Item] = []
-    for p in sorted(SKETCHES_DIR.glob("*.png"), reverse=True):
-        meta_path = p.with_suffix(".json")
+    for path in sorted(SKETCHES_DIR.glob("*.png"), reverse=True):
+        meta_path = path.with_suffix(".json")
         meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-        with open(p, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode()
+        with open(path, "rb") as file:
+            b64 = base64.b64encode(file.read()).decode()
         sketches.append(
             Sketches.Item(
-                filename=p.name,
+                filename=path.name,
                 dataUrl=f"data:image/png;base64,{b64}",
                 phoneId=meta.get("phoneId", "unknown"),
                 phoneColor=meta.get("phoneColor", "#888888"),

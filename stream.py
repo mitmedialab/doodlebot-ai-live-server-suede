@@ -10,22 +10,30 @@ from .common import add_listener, remove_listener
 
 router = APIRouter()
 
+HEARTBEAT_TIMEOUT_SECONDS = 25
+"""
+Seconds to wait for an event before sending a keep-alive ping,
+so idle connections aren't dropped by proxies or the browser.
+"""
+
 
 @router.get("/stream")
 async def stream() -> StreamingResponse:
-    q = add_listener()
+    message_queue = add_listener()
 
     async def generate() -> AsyncGenerator[str, None]:
         yield "event: connected\ndata: {}\n\n"
         try:
             while True:
                 try:
-                    msg = await asyncio.to_thread(q.get, True, 25)
+                    msg = await asyncio.to_thread(
+                        message_queue.get, True, HEARTBEAT_TIMEOUT_SECONDS
+                    )
                     yield msg
                 except queue.Empty:
                     yield ": ping\n\n"
         finally:
-            remove_listener(q)
+            remove_listener(message_queue)
 
     return StreamingResponse(
         generate(),
