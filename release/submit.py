@@ -39,11 +39,11 @@ async def submit(payload: Submit.Request) -> Submit.Response:
     if image_data.startswith("data:image/png;base64,"):
         image_data = image_data[len("data:image/png;base64,") :]
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    filename = f"sketch_{ts}.png"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"sketch_{timestamp}.png"
 
-    with open(PENDING_DIR / filename, "wb") as f:
-        f.write(base64.b64decode(image_data))
+    with open(PENDING_DIR / filename, "wb") as file:
+        file.write(base64.b64decode(image_data))
 
     created = datetime.now().isoformat()
     meta = {
@@ -54,8 +54,8 @@ async def submit(payload: Submit.Request) -> Submit.Response:
         "created": created,
         "status": "pending",
     }
-    with open(PENDING_DIR / f"sketch_{ts}.json", "w") as f:
-        json.dump(meta, f)
+    with open(PENDING_DIR / f"sketch_{timestamp}.json", "w") as file:
+        json.dump(meta, file)
 
     print(f"[+] Pending {filename} from {phone_id} ({kind})")
     broadcast(

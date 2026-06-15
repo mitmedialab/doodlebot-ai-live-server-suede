@@ -117,12 +117,10 @@ async def combine_sketches(
     if not model_ids:
         raise HTTPException(status_code=400, detail="Select at least one model")
 
-    # validate models
-    for mid in model_ids:
-        if mid not in MODELS:
-            raise HTTPException(status_code=400, detail=f"Unknown model: {mid}")
+    for model_id in model_ids:
+        if model_id not in MODELS:
+            raise HTTPException(status_code=400, detail=f"Unknown model: {model_id}")
 
-    # resolve prompt — textarea always contains the full prompt
     prompt = (
         extra
         or load_presets().get(preset, "")
@@ -132,16 +130,16 @@ async def combine_sketches(
     # gather files
     involved_phones: list[Phone] = []
     image_files: list[Path] = []
-    for fname in filenames:
-        fpath = SKETCHES_DIR / fname
-        if not fpath.exists():
-            raise HTTPException(status_code=404, detail=f"File not found: {fname}")
-        image_files.append(fpath)
-        meta_path = fpath.with_suffix(".json")
+    for name in filenames:
+        file = SKETCHES_DIR / name
+        if not file.exists():
+            raise HTTPException(status_code=404, detail=f"File not found: {name}")
+        image_files.append(file)
+        meta_path = file.with_suffix(".json")
         if meta_path.exists():
-            m = json.loads(meta_path.read_text())
+            meta = json.loads(meta_path.read_text())
             involved_phones.append(
-                Phone(phoneId=m.get("phoneId"), phoneColor=m.get("phoneColor"))
+                Phone(phoneId=meta.get("phoneId"), phoneColor=meta.get("phoneColor"))
             )
 
     broadcast(
@@ -150,41 +148,41 @@ async def combine_sketches(
 
     # run each selected model
     results: list[Combine.Response.Result] = []
-    for mid in model_ids:
-        provider = MODELS[mid]["provider"]
-        label = MODELS[mid]["label"]
+    for model_id in model_ids:
+        provider = MODELS[model_id]["provider"]
+        label = MODELS[model_id]["label"]
         if provider == "openai" and not OPENAI_API_KEY:
             results.append(
                 Combine.Response.Result(
-                    model=mid, model_label=label, error="OPENAI_API_KEY not set"
+                    model=model_id, model_label=label, error="OPENAI_API_KEY not set"
                 )
             )
             continue
         if provider == "gemini" and not GEMINI_API_KEY:
             results.append(
                 Combine.Response.Result(
-                    model=mid, model_label=label, error="GEMINI_API_KEY not set"
+                    model=model_id, model_label=label, error="GEMINI_API_KEY not set"
                 )
             )
             continue
         try:
             if provider == "openai":
                 image_b64 = await asyncio.to_thread(
-                    Combine.openai, mid, image_files, prompt
+                    Combine.openai, model_id, image_files, prompt
                 )
             else:
                 image_b64 = await asyncio.to_thread(
-                    Combine.gemini, mid, image_files, prompt
+                    Combine.gemini, model_id, image_files, prompt
                 )
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            image_file = COMBINED_DIR / f"combined_{mid}_{ts}.png"
+            image_file = COMBINED_DIR / f"combined_{model_id}_{ts}.png"
             with open(image_file, "wb") as f:
                 f.write(base64.b64decode(image_b64))
 
             results.append(
                 Combine.Response.Result(
-                    model=mid,
+                    model=model_id,
                     model_label=label,
                     image=f"data:image/png;base64,{image_b64}",
                     saved_as=image_file.name,
@@ -194,7 +192,7 @@ async def combine_sketches(
         except Exception as e:
             print(f"[!] Combine error ({label}): {e}")
             results.append(
-                Combine.Response.Result(model=mid, model_label=label, error=str(e))
+                Combine.Response.Result(model=model_id, model_label=label, error=str(e))
             )
 
     broadcast(
