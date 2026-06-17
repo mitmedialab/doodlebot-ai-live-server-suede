@@ -12,7 +12,18 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from .config import ADMIN_TOKEN, OPENAI_API_KEY, GEMINI_API_KEY
-from . import pages, stream, submit, moderation, sketches, models, presets, combine
+from . import (
+    pages,
+    stream,
+    submit,
+    moderation,
+    sketches,
+    models,
+    presets,
+    combine,
+    vectorize,
+    robots,
+)
 
 app = FastAPI()
 
@@ -24,7 +35,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-for module in (pages, stream, submit, moderation, sketches, models, presets, combine):
+for module in (
+    pages,
+    stream,
+    submit,
+    moderation,
+    sketches,
+    models,
+    presets,
+    combine,
+    vectorize,
+    robots,
+):
     app.include_router(module.router)
 
 
