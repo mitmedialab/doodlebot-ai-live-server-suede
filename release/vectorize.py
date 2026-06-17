@@ -1,7 +1,7 @@
 from .arc_line_vectorization_suede import default_pipeline, DrawingCommand
 from .arc_line_vectorization_suede.visualize import commands_to_svg_compare
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import APIRouter, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 import numpy as np
@@ -12,19 +12,7 @@ from functools import wraps
 import io
 from typing import Sequence
 
-app = FastAPI(
-    title="Vectorization API",
-    description="An API that converts images into vectorized drawing commands",
-    version="1.0.0",
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
-    # "http://localhost:8602", "http://doodlebot.media.mit.edu"
-    allow_credentials=True,
-    allow_methods=["GET", "POST"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
-)
+router = APIRouter()
 
 
 def _commands_to_jsonable(commands: Sequence[DrawingCommand]):
@@ -85,7 +73,7 @@ def handle_errors(func):
     return wrapper
 
 
-@app.post("/")
+@router.post("/vectorize")
 @handle_errors
 async def vectorize_endpoint(image_file: UploadFile = File(...)):
     """Vectorize an uploaded image into robot drawing commands.
