@@ -28,7 +28,6 @@ for module in (pages, stream, submit, moderation, sketches, models, presets, com
     app.include_router(module.router)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("=" * 60)
     print("  Sketch Server")
@@ -36,11 +35,13 @@ if __name__ == "__main__":
     print(f"  Draw page    : http://localhost:5000/")
     print(f"  Gallery page : http://localhost:5000/gallery")
     print(f"  Display page : http://localhost:5000/display")
-    print(f"  Admin token  : {ADMIN_TOKEN}")
+    if ADMIN_TOKEN == "test":
+        print("  ⚠  WARNING: Using default ADMIN_TOKEN!")
+    else:
+        print(f"  Admin token  : {ADMIN_TOKEN}")
     print(f"  OpenAI key   : {'set ✓' if OPENAI_API_KEY else 'NOT SET ✗'}")
     print(f"  Gemini key   : {'set ✓' if GEMINI_API_KEY else 'NOT SET ✗'}")
     print("=" * 60)
-    if ADMIN_TOKEN == "change-me-please":
-        print("  ⚠  WARNING: Using default ADMIN_TOKEN!")
+
     print()
     uvicorn.run(app, host="0.0.0.0", port=5000)
