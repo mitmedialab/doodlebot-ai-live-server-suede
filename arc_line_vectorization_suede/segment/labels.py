@@ -42,7 +42,7 @@ from typing import List
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy.spatial import cKDTree
+from scipy.spatial import KDTree
 
 
 @dataclass(frozen=True)
@@ -145,7 +145,7 @@ def assign_raw_segment_labels(
     raw_pixels = np.concatenate(all_points, axis=0)
     raw_ids = np.concatenate(all_ids, axis=0)
     raw_local_indices = np.concatenate(all_local_indices, axis=0)
-    tree = cKDTree(raw_pixels)
+    tree = KDTree(raw_pixels)
 
     out: List[LabeledSegment] = []
     for fp in final_segments:
