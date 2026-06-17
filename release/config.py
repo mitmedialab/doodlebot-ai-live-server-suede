@@ -11,6 +11,16 @@ COMBINED_DIR = Path("combined")
 COMBINED_DIR.mkdir(exist_ok=True)
 PRESETS_FILE = Path("presets.json")
 
+STATIC_DIR = Path("static")
+"""
+Front-end HTML cache. Pages are fetched from `STATIC_HOST` on first request and cached here. 
+POST `/static/bust` (or navigating to `/static/bust?token=...` in browser using `ADMIN_TOKEN`) 
+clears it to pick up a redeployed front-end.
+"""
+
+STATIC_DIR.mkdir(exist_ok=True)
+STATIC_HOST = os.environ.get("STATIC_HOST", "https://mitmedialab.github.io")
+
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "test")
