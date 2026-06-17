@@ -70,8 +70,23 @@ expect_no_args() {
   [ "$#" -eq 0 ] || die "'${name}' takes no arguments (got: $*)"
 }
 
+# compose.yml bind-mounts ./presets.json as a *file*. If it's missing, Docker
+# silently creates a directory in its place, which then breaks the server's JSON
+# read. Ensure it exists as a file (seeded with an empty JSON object) first.
+ensure_presets_file() {
+  local presets="presets.json"
+  if [ -d "${presets}" ]; then
+    die "'${presets}' is a directory (likely created by a failed bind mount); remove it and retry"
+  fi
+  if [ ! -f "${presets}" ]; then
+    echo "==> Creating missing ${presets} (seeded with {})"
+    echo '{}' > "${presets}"
+  fi
+}
+
 cmd_start() {
   expect_no_args start "$@"
+  ensure_presets_file
   echo "==> Building ${SERVICE} image"
   compose build "${SERVICE}"
 
