@@ -1,3 +1,7 @@
 **/*.png
 **/*.gif
 **/__pycache__
+pending
+combined
+sketches
+static
