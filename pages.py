@@ -49,10 +49,9 @@ async def display_page() -> FileResponse:
     return await _serve("display.html")
 
 
-@router.get("/vectorize")
+@router.get("/vectorization")
 async def vectorization_page() -> FileResponse:
-    return await _serve("vectorize.html")
-
+    return await _serve("vectorization.html")
 
 @router.api_route("/static/bust", methods=["GET", "POST"])
 async def bust_static(req: Request) -> RedirectResponse:
