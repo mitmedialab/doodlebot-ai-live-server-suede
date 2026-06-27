@@ -329,6 +329,14 @@ class _Coordinator:
             self._store.remove(canvas_id)
             self._drawings.pop(canvas_id, None)
 
+    def clear_drawings(self, canvas_id: str) -> int:
+        with self._lock:
+            if canvas_id not in self._drawings:
+                raise KeyError(canvas_id)
+            count = len(self._drawings[canvas_id])
+            self._drawings[canvas_id] = []
+            return count
+
     # -- enqueue (on approval) ---------------------------------------------- #
 
     def next_job_id(self) -> str:
@@ -681,6 +689,22 @@ async def delete_canvas(canvas_id: str, request: Request) -> None:
         coordinator.remove_canvas(canvas_id)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Canvas '{canvas_id}' not found")
+
+
+class ClearedDrawings(BaseModel):
+    cleared: int
+
+
+@router.delete("/api/robots/canvases/{canvas_id}/drawings")
+async def clear_drawings(canvas_id: str, request: Request) -> ClearedDrawings:
+    """Admin: clear all placed drawings from a canvas (does not reset occupancy)."""
+    require_admin(request)
+    try:
+        cleared = coordinator.clear_drawings(canvas_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Canvas '{canvas_id}' not found")
+    print(f"[robots] cleared {cleared} drawing(s) from canvas '{canvas_id}'")
+    return ClearedDrawings(cleared=cleared)
 
 
 @router.post("/api/robots/canvases")
