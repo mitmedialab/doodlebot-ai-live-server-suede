@@ -129,15 +129,6 @@ class RegionConfig(BaseModel):
     robot: Optional[str] = None  # the robot name assigned to draw this region
 
 
-class StrokeConfig(BaseModel):
-    job_id: str
-    robot_name: str
-    anchor_x: float
-    anchor_y: float
-    angle_deg: float
-    strokes: list
-
-
 class PlacementSettings(BaseModel):
     cellMm: float = 2.0
     penMm: float = 3.0
@@ -333,6 +324,11 @@ class _Coordinator:
         with self._lock:
             self._store.upsert(_build_canvas(cfg))
 
+    def remove_canvas(self, canvas_id: str) -> None:
+        with self._lock:
+            self._store.remove(canvas_id)
+            self._drawings.pop(canvas_id, None)
+
     # -- enqueue (on approval) ---------------------------------------------- #
 
     def next_job_id(self) -> str:
@@ -486,9 +482,7 @@ class _Coordinator:
                     ),
                     commands=qj.drawing,
                 )
-                self.add_drawing(
-                    canvas.id, qj.job.jobId, bot.name, qj.drawing, placement
-                )
+                self.add_drawing(canvas.id, qj.job, bot.name, qj.drawing, placement)
                 placed = True
                 break
 
@@ -541,7 +535,7 @@ class _Coordinator:
             placement.anchor_y,
             placement.angle_deg,
         )
-        if canvas_id not in self._drawings:
+        if not self._drawings[canvas_id]:
             self._drawings[canvas_id] = []
         self._drawings[canvas_id].append(
             PlacedDrawing(
@@ -637,7 +631,7 @@ class Canvases(BaseModel):
         height: float
         markers: list[ArucoMarker]
         regions: list[RegionConfig]
-        drawings: list[StrokeConfig]
+        drawings: list[PlacedDrawing]
         freeFractionByRegion: dict[str, float]
 
     canvases: list["Canvases.Item"]
@@ -652,9 +646,6 @@ async def get_canvases(request: Request) -> Canvases:
     require_admin(request)
     items: list[Canvases.Item] = []
     for c in coordinator.canvases():
-        drawings = []
-        if c.id in coordinator._drawings:
-            drawings = coordinator._drawings[c.id]
         items.append(
             Canvases.Item(
                 id=c.id,
@@ -675,21 +666,21 @@ async def get_canvases(request: Request) -> Canvases:
                     )
                     for r in c.regions
                 ],
-                drawings=[
-                    StrokeConfig(
-                        job_id=s.job_id,
-                        anchor_x=s.anchor_x,
-                        anchor_y=s.anchor_y,
-                        angle_deg=s.angle_deg,
-                        strokes=s.strokes,
-                        robot_name=s.robot_name,
-                    )
-                    for s in drawings
-                ],
+                drawings=coordinator._drawings[c.id],
                 freeFractionByRegion={r.id: r.free_fraction for r in c.regions},
             )
         )
     return Canvases(canvases=items)
+
+
+@router.delete("/api/robots/canvases/{canvas_id}")
+async def delete_canvas(canvas_id: str, request: Request) -> None:
+    """Admin: delete a canvas by id."""
+    require_admin(request)
+    try:
+        coordinator.remove_canvas(canvas_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Canvas '{canvas_id}' not found")
 
 
 @router.post("/api/robots/canvases")
