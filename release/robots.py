@@ -524,6 +524,7 @@ class _Coordinator:
                 scaled_commands = qj.drawing
                 while placement is None:
                     scaled_commands = self.scale_commands(scaled_commands, 0.1)
+                    print(scaled_commands[0])
                     new_strokes = self.replay_to_world(
                         scaled_commands,
                         0,
@@ -534,6 +535,7 @@ class _Coordinator:
                     print("new placement", placement)
 
                 region.commit(placement)
+                print(scaled_commands)
                 bot.staged = _StagedJob(
                     job=qj.job,
                     navigate_to=Pose(
