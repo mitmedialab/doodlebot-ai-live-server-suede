@@ -104,7 +104,9 @@ class ArucoMarker(BaseModel):
     id: int
     position: Point
     sizeMm: Optional[float] = None
-    yawRadians: Optional[float] = None  # server-derived from the canvas edge; ignored on input
+    yawRadians: Optional[float] = (
+        None  # server-derived from the canvas edge; ignored on input
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -550,7 +552,12 @@ class _Coordinator:
                     commands=scaled_commands,
                 )
                 self.add_drawing(
-                    canvas.id, qj.job.jobId, bot.name, scaled_commands, placement, qj.heading0
+                    canvas.id,
+                    qj.job.jobId,
+                    bot.name,
+                    scaled_commands,
+                    placement,
+                    qj.heading0,
                 )
                 placed = True
                 break
@@ -595,7 +602,7 @@ class _Coordinator:
         region: Region,
         qj: "_QueuedJob",
         min_scale: float = 0.4,
-        iters: int = 7,
+        iters: int = 20,
     ) -> tuple[Optional[Placement], list]:
         """Largest uniform scale in ``[min_scale, 1)`` whose footprint fits.
 
@@ -730,7 +737,12 @@ async def get_markers(robot: Optional[str] = None) -> Markers:
     )
     return Markers(
         markers=[
-            ArucoMarker(id=m.id, position=Point(x=m.x, y=m.y), sizeMm=m.size_mm, yawRadians=m.yaw)
+            ArucoMarker(
+                id=m.id,
+                position=Point(x=m.x, y=m.y),
+                sizeMm=m.size_mm,
+                yawRadians=m.yaw,
+            )
             for m in markers
         ]
     )
@@ -773,7 +785,12 @@ async def get_canvases(request: Request) -> Canvases:
                 width=c.width,
                 height=c.height,
                 markers=[
-                    ArucoMarker(id=m.id, position=Point(x=m.x, y=m.y), sizeMm=m.size_mm, yawRadians=m.yaw)
+                    ArucoMarker(
+                        id=m.id,
+                        position=Point(x=m.x, y=m.y),
+                        sizeMm=m.size_mm,
+                        yawRadians=m.yaw,
+                    )
                     for m in c.markers
                 ],
                 regions=[
