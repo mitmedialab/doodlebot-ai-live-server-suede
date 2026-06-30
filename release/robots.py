@@ -147,7 +147,7 @@ class PlacementSettings(BaseModel):
     clearanceMm: float = 8.0
     searchStepCells: int = 2
     angleStepDeg: float = 15.0  # rotations tried = 0, step, 2·step, … < 360
-    strategy: Literal["bottom_left", "scatter"] = "bottom_left"
+    strategy: Literal["origin", "scatter"] = "origin"
 
 
 class CanvasConfig(BaseModel):
@@ -503,7 +503,6 @@ class _Coordinator:
         for a different ready bot — re-tried on every check-in).
         """
 
-        print("queue", self._queue)
         if not self._queue:
             return
 
@@ -524,8 +523,6 @@ class _Coordinator:
             for bot in candidates:
                 region = self._store.region_for_robot(bot.name)
                 canvas = self._store.canvas_for_robot(bot.name)
-                print("region", region)
-                print("canvas", canvas)
                 assert region is not None
                 assert canvas is not None
                 # The placement search rotates the ink for a tighter fit; that
@@ -534,19 +531,13 @@ class _Coordinator:
                 placement = region.try_place(
                     qj.strokes, rng=self._rng, footprints=qj.footprints
                 )
-                print("placement", placement)
-                new_strokes = qj.strokes
                 scaled_commands = qj.drawing
-                while placement is None:
-                    scaled_commands = self.scale_commands(scaled_commands, 0.1)
-                    new_strokes = self.replay_to_world(
-                        scaled_commands,
-                        0,
-                        0,
-                        qj.heading0,
-                    )
-                    placement = region.try_place(new_strokes, rng=self._rng)
-                    print("new placement", placement)
+                if placement is None:
+                    # Full size won't fit here; shrink only as far as needed to
+                    # land the largest version that fits (or give up on this bot).
+                    placement, scaled_commands = self._place_shrunk(region, qj)
+                if placement is None:
+                    continue  # doesn't fit even at min scale — try another bot
 
                 region.commit(placement)
                 bot.staged = _StagedJob(
@@ -559,7 +550,7 @@ class _Coordinator:
                     commands=scaled_commands,
                 )
                 self.add_drawing(
-                    canvas.id, qj.job.jobId, bot.name, scaled_commands, placement
+                    canvas.id, qj.job.jobId, bot.name, scaled_commands, placement, qj.heading0
                 )
                 placed = True
                 break
@@ -599,6 +590,36 @@ class _Coordinator:
             )
         return world
 
+    def _place_shrunk(
+        self,
+        region: Region,
+        qj: "_QueuedJob",
+        min_scale: float = 0.4,
+        iters: int = 7,
+    ) -> tuple[Optional[Placement], list]:
+        """Largest uniform scale in ``[min_scale, 1)`` whose footprint fits.
+
+        Footprint-fits-region is monotonic in scale (a smaller drawing fits
+        wherever a larger one does), so we binary-search for the biggest scale
+        that still places instead of collapsing to a fixed fraction. Returns
+        ``(placement, scaled_commands)`` for that best fit, or ``(None, drawing)``
+        if even ``min_scale`` won't fit — in which case the caller leaves the job
+        queued rather than drawing an illegibly tiny speck.
+        """
+        lo, hi = min_scale, 1.0
+        best: Optional[Placement] = None
+        best_commands: list = qj.drawing
+        for _ in range(iters):
+            mid = (lo + hi) / 2.0
+            commands = self.scale_commands(qj.drawing, mid)
+            strokes = self.replay_to_world(commands, 0, 0, qj.heading0)
+            placement = region.try_place(strokes, rng=self._rng)
+            if placement is not None:
+                best, best_commands, lo = placement, commands, mid  # fits → go bigger
+            else:
+                hi = mid  # too big → shrink the upper bound
+        return best, best_commands
+
     def add_drawing(
         self,
         canvas_id: str,
@@ -606,12 +627,20 @@ class _Coordinator:
         robot_name: str,
         commands: list,
         placement: Placement,
+        heading0: float,
     ) -> None:
+        # The reserved footprint is the ink at orientation ``heading0 + angle``
+        # (the lead-in heading baked into the strokes, plus the placement search's
+        # rotation) — the same heading the robot is told to approach with. Replay
+        # at that heading so the recorded strokes match the committed occupancy and
+        # what the bot actually draws; using ``angle`` alone drops ``heading0`` and
+        # swings the drawing off its real pose.
+        world_heading = heading0 + placement.angle_deg
         world_strokes = self.replay_to_world(
             commands,
             placement.anchor_x,
             placement.anchor_y,
-            placement.angle_deg,
+            world_heading,
         )
         if canvas_id not in self._drawings:
             self._drawings[canvas_id] = []
@@ -621,7 +650,7 @@ class _Coordinator:
                 robot_name=robot_name,
                 anchor_x=placement.anchor_x,
                 anchor_y=placement.anchor_y,
-                angle_deg=placement.angle_deg,
+                angle_deg=world_heading,
                 commands=commands,
                 strokes=world_strokes,
             )
