@@ -42,7 +42,6 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from release import canvas as canvas_engine  # noqa: E402
 from release.robots import (  # noqa: E402
     ArucoMarker,
     CanvasConfig,
@@ -64,9 +63,11 @@ CANVAS_W = 1000.0
 CANVAS_H = 1000.0
 
 # Source vectorizations can be in arbitrary units (the sample is larger than the
-# whole canvas). Normalize each so its longest footprint dimension is this many
-# mm — big enough that several pack into the region, small enough that they fit
-# at full size until the canvas genuinely fills (then the shrink fallback fires).
+# whole canvas). The coordinator now sizes each drawing to the canvas's
+# ``targetFootprintMm`` before placing, so we just set that on the canvas config
+# rather than pre-scaling here — big enough that several pack into the region,
+# small enough that they fit until it genuinely fills (then the shrink fallback
+# fires).
 TARGET_MM = 320.0
 
 # How many drawings to lay down before the observed run, to fill the canvas.
@@ -83,44 +84,19 @@ _PALETTE = [
 # --------------------------------------------------------------------------- #
 
 
-def _scale_raw(commands: list[dict], factor: float) -> list[dict]:
-    """Scale a raw command list: distances + arc radii grow, spins are unchanged."""
-    out: list[dict] = []
-    for cmd in commands:
-        c = dict(cmd)
-        if c.get("kind") == "line":
-            c["distance"] = c["distance"] * factor
-        elif c.get("kind") == "arc":
-            c["radius"] = c["radius"] * factor
-        out.append(c)
-    return out
-
-
-def _normalize(commands: list[dict], target_mm: float) -> list[dict]:
-    """Rescale so the drawing's longest pen-down extent is ~``target_mm``."""
-    strokes = canvas_engine.commands_to_strokes(
-        DrawingJob(jobId="probe", commands=commands).commands
-    )
-    pts = [p for s in strokes for p in s]
-    if not pts:
-        return commands
-    xs = [p[0] for p in pts]
-    ys = [p[1] for p in pts]
-    span = max(max(xs) - min(xs), max(ys) - min(ys))
-    if span <= 0:
-        return commands
-    return _scale_raw(commands, target_mm / span)
-
-
 def _load_vectorizations() -> list[tuple[str, list[dict]]]:
-    """Every ``*.json`` in tests/vectorizations as (name, normalized command list)."""
+    """Every ``*.json`` in tests/vectorizations as (name, raw command list).
+
+    No pre-scaling: the coordinator sizes each drawing to the canvas's
+    ``targetFootprintMm`` at placement time.
+    """
     files = sorted(glob.glob(os.path.join(VEC_DIR, "*.json")))
     out: list[tuple[str, list[dict]]] = []
     for path in files:
         with open(path) as fh:
             commands = json.load(fh)
         name = os.path.splitext(os.path.basename(path))[0]
-        out.append((name, _normalize(commands, TARGET_MM)))
+        out.append((name, commands))
     return out
 
 
@@ -140,7 +116,7 @@ def _make_canvas(strategy: str) -> CanvasConfig:
         regions=[
             RegionConfig(id="full", x=0.0, y=0.0, width=CANVAS_W, height=CANVAS_H, robot=ROBOT)
         ],
-        placement=PlacementSettings(strategy=strategy),
+        placement=PlacementSettings(strategy=strategy, targetFootprintMm=TARGET_MM),
     )
 
 
