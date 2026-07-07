@@ -1,0 +1,236 @@
+[
+  {
+    "kind": "spin",
+    "degrees": 39.170467039448724
+  },
+  {
+    "kind": "line",
+    "distance": 415.1249244980225,
+    "penDown": false
+  },
+  {
+    "kind": "spin",
+    "degrees": -35.630178954402794
+  },
+  {
+    "kind": "arc",
+    "radius": 249.4427457700804,
+    "degrees": 129.26848231141688
+  },
+  {
+    "kind": "spin",
+    "degrees": 48.49561461039806
+  },
+  {
+    "kind": "arc",
+    "radius": 245.09795882070122,
+    "degrees": 133.74042996828842
+  },
+  {
+    "kind": "spin",
+    "degrees": 135.34599268952874
+  },
+  {
+    "kind": "line",
+    "distance": 20.790192675639954,
+    "penDown": false
+  },
+  {
+    "kind": "spin",
+    "degrees": -179.99755972930086
+  },
+  {
+    "kind": "line",
+    "distance": 193.9954393040921,
+    "penDown": true
+  },
+  {
+    "kind": "spin",
+    "degrees": 115.76019490240878
+  },
+  {
+    "kind": "line",
+    "distance": 61.24854930687979,
+    "penDown": false
+  },
+  {
+    "kind": "spin",
+    "degrees": 63.84653379435941
+  },
+  {
+    "kind": "line",
+    "distance": 175.99999999998622,
+    "penDown": true
+  },
+  {
+    "kind": "spin",
+    "degrees": -34.662719867643375
+  },
+  {
+    "kind": "line",
+    "distance": 63.13920847095546,
+    "penDown": false
+  },
+  {
+    "kind": "spin",
+    "degrees": 83.5393370270912
+  },
+  {
+    "kind": "arc",
+    "radius": 18.435138774315494,
+    "degrees": -183.7810903283639
+  },
+  {
+    "kind": "spin",
+    "degrees": -41.3746460415514
+  },
+  {
+    "kind": "arc",
+    "radius": 25.302633893570636,
+    "degrees": -93.46992982277389
+  },
+  {
+    "kind": "spin",
+    "degrees": -27.58838298793751
+  },
+  {
+    "kind": "line",
+    "distance": 298.4928453337721,
+    "penDown": false
+  },
+  {
+    "kind": "spin",
+    "degrees": -63.493954916190766
+  },
+  {
+    "kind": "line",
+    "distance": 121.08095103660705,
+    "penDown": true
+  },
+  {
+    "kind": "spin",
+    "degrees": 30.2766161211914
+  },
+  {
+    "kind": "arc",
+    "radius": 169.72202817634354,
+    "degrees": -207.56904752340012
+  },
+  {
+    "kind": "spin",
+    "degrees": -8.5375532890284
+  },
+  {
+    "kind": "line",
+    "distance": 233.70893905809567,
+    "penDown": false
+  },
+  {
+    "kind": "spin",
+    "degrees": 87.55346127422673
+  },
+  {
+    "kind": "line",
+    "distance": 262.14035017334425,
+    "penDown": true
+  },
+  {
+    "kind": "spin",
+    "degrees": -34.767300350174196
+  },
+  {
+    "kind": "line",
+    "distance": 6.266035595051365,
+    "penDown": false
+  },
+  {
+    "kind": "spin",
+    "degrees": -179.84991963128525
+  },
+  {
+    "kind": "arc",
+    "radius": 1082.8017589900937,
+    "degrees": -12.047789885716801
+  },
+  {
+    "kind": "spin",
+    "degrees": 11.861559679273284
+  },
+  {
+    "kind": "line",
+    "distance": 18.240967575628346,
+    "penDown": true
+  },
+  {
+    "kind": "spin",
+    "degrees": -82.18079941140023
+  },
+  {
+    "kind": "line",
+    "distance": 108.43027883440455,
+    "penDown": false
+  },
+  {
+    "kind": "spin",
+    "degrees": -36.85146820241147
+  },
+  {
+    "kind": "arc",
+    "radius": 120.89068534581962,
+    "degrees": 160.0104479227199
+  },
+  {
+    "kind": "spin",
+    "degrees": 38.89231623440263
+  },
+  {
+    "kind": "arc",
+    "radius": 176.08200279424534,
+    "degrees": 40.77157417199515
+  },
+  {
+    "kind": "spin",
+    "degrees": 3.1393140277236413
+  },
+  {
+    "kind": "arc",
+    "radius": 950.2276750891803,
+    "degrees": -8.598841821613638
+  },
+  {
+    "kind": "spin",
+    "degrees": -25.149814817717264
+  },
+  {
+    "kind": "arc",
+    "radius": 25.944752979396164,
+    "degrees": 201.35126056355952
+  },
+  {
+    "kind": "spin",
+    "degrees": -48.081369041002645
+  },
+  {
+    "kind": "line",
+    "distance": 95.52166355600434,
+    "penDown": true
+  },
+  {
+    "kind": "spin",
+    "degrees": 61.27282087154095
+  },
+  {
+    "kind": "line",
+    "distance": 99.1945764511146,
+    "penDown": false
+  },
+  {
+    "kind": "spin",
+    "degrees": -93.53907238427348
+  },
+  {
+    "kind": "arc",
+    "radius": 317.8900675184552,
+    "degrees": -140.6766796304064
+  }
+]
