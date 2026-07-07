@@ -538,6 +538,7 @@ class _Coordinator:
 
                 region.commit(placement)
                 print(scaled_commands)
+                print("new strokes", new_strokes)
                 bot.staged = _StagedJob(
                     job=qj.job,
                     strokes=new_strokes,
