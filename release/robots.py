@@ -45,7 +45,7 @@ from .canvas import (
     Marker,
     PlacementConfig,
     Region,
-    Stroke
+    Stroke,
     Placement,
 )
 from .common import require_admin
