@@ -559,6 +559,8 @@ class _Coordinator:
                     continue  # doesn't fit even at min scale — try another bot
 
                 region.commit(placement)
+                print(scaled_commands)
+                print("new strokes", new_strokes)
                 bot.staged = _StagedJob(
                     job=qj.job,
                     strokes=new_strokes,
