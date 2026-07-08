@@ -542,12 +542,12 @@ class _Coordinator:
                 record.staged = None
                 record.status = "drawing"
                 record.ready_since = None
-                exit_pose = compute_exit_pose(
-                    staged.job.strokes, canvas.markers, region
+                strokes = self.replay_to_world(
+                    staged.commands, 0, 0, staged.job.heading0
                 )
+                exit_pose = compute_exit_pose(strokes, canvas.markers, region)
                 return CheckIn.Draw(
                     jobId=staged.job.jobId,
-                    strokes=staged.job.strokes,
                     navigateTo=staged.navigate_to,
                     commands=staged.commands,
                     exitPose=exit_pose,
@@ -654,7 +654,6 @@ class _Coordinator:
 
                 bot.staged = _StagedJob(
                     job=qj.job,
-                    strokes=strokes,
                     navigate_to=Pose(
                         x=placement.anchor_x,
                         y=placement.anchor_y,
@@ -1014,7 +1013,6 @@ async def post_job(payload: EnqueueDrawing, request: Request) -> DrawingJob:
         raise HTTPException(status_code=400, detail="No drawing commands")
     return enqueue_drawing(
         commands=payload.commands,
-        strokes=payload.strokes,
         exit_pose=payload.exitPose,
         source_filename=payload.sourceFilename,
     )
@@ -1042,7 +1040,6 @@ async def list_jobs(request: Request) -> QueuedJobs:
         jobs=[
             QueuedJobs.Item(
                 jobId=j.jobId,
-                strokes=j.strokes,
                 commandCount=len(j.commands),
                 sourceFilename=j.sourceFilename,
             )
