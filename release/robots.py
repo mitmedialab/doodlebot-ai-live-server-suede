@@ -542,9 +542,7 @@ class _Coordinator:
                 record.staged = None
                 record.status = "drawing"
                 record.ready_since = None
-                strokes = self.replay_to_world(
-                    staged.commands, 0, 0, staged.job.heading0
-                )
+                strokes = self.replay_to_world(staged.commands, 0, 0, 0)
                 exit_pose = compute_exit_pose(strokes, canvas.markers, region)
                 return CheckIn.Draw(
                     jobId=staged.job.jobId,
