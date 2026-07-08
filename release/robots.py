@@ -282,7 +282,6 @@ class DrawingJob(BaseModel):
 
     jobId: str
     commands: list[DrawingCommand]
-    strokes: list[Stroke]
     exitPose: Optional[Pose] = None
     sourceFilename: Optional[str] = None
 
@@ -305,7 +304,6 @@ def _span(strokes: list) -> float:
 @dataclass
 class _StagedJob:
     job: DrawingJob
-    strokes: list[Stroke]
     navigate_to: Pose  # resolved start pose (first ink point + approach heading)
     commands: list[DrawingCommand]  # the drawing with its lead-in stripped off
 
@@ -830,7 +828,6 @@ coordinator = _Coordinator(DEFAULT_CANVASES)
 
 def enqueue_drawing(
     commands: list[DrawingCommand],
-    strokes: list[Stroke],
     exit_pose: Optional[Pose] = None,
     source_filename: Optional[str] = None,
 ) -> DrawingJob:
@@ -843,7 +840,6 @@ def enqueue_drawing(
 
     job = DrawingJob(
         jobId=coordinator.next_job_id(),
-        strokes=strokes,
         commands=commands,
         exitPose=exit_pose or None,
         sourceFilename=source_filename,
@@ -1046,6 +1042,7 @@ async def list_jobs(request: Request) -> QueuedJobs:
         jobs=[
             QueuedJobs.Item(
                 jobId=j.jobId,
+                strokes=j.strokes,
                 commandCount=len(j.commands),
                 sourceFilename=j.sourceFilename,
             )
