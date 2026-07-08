@@ -661,16 +661,23 @@ class _Coordinator:
                 region.commit(placement)
                 print(scaled_commands)
 
+                staged_angle = qj.heading0 + placement.angle_deg
                 bot.staged = _StagedJob(
                     job=qj.job,
                     navigate_to=Pose(
                         x=placement.anchor_x,
                         y=placement.anchor_y,
-                        headingDegrees=qj.heading0 + placement.angle_deg,
+                        headingDegrees=staged_angle,
                     ),
                     commands=scaled_commands,
                 )
-                exit_pose = compute_exit_pose(strokes, canvas.markers, region)
+                drawing_strokes = self.replay_to_world(
+                    scaled_commands,
+                    placement.anchor_x,
+                    y=placement.anchor_y,
+                    staged_angle,
+                )
+                exit_pose = compute_exit_pose(drawing_strokes, canvas.markers, region)
                 self.add_drawing(
                     canvas.id,
                     qj.job.jobId,
