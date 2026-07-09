@@ -353,7 +353,7 @@ def compute_exit_pose(
     marker_weight: float = 1.0,
     center_weight: float = 2.0,
     debug_plot: bool = False,
-) -> Pose | None:
+) -> Pose | None: 
 
     drawing = unary_union(
         [
