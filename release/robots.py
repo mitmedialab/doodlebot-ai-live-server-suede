@@ -347,8 +347,12 @@ def compute_exit_pose(
     allowed_region: Region | None = None,
     robot_radius: float = 0.08,
     min_marker_distance: float = 0.05,
-    max_marker_distance: float = 0.5,
+    max_marker_distance: float = 1,
     distance_step: float = 0.005,
+    boundary: float = 0.15,
+    marker_weight: float = 1.0,
+    center_weight: float = 2.0,
+    debug_plot: bool = False,
 ) -> Pose | None:
 
     drawing = unary_union(
@@ -359,17 +363,33 @@ def compute_exit_pose(
         ]
     )
 
+    best_pose = None
+    best_score = float("inf")
+
     robot = np.array(strokes[-1][-1])
 
-    best_pose = None
-    best_distance = float("inf")
+    # Region center
+    if allowed_region is not None:
+        region_center = np.array(
+            [
+                allowed_region.x + allowed_region.width / 2,
+                allowed_region.y + allowed_region.height / 2,
+            ]
+        )
+    else:
+        region_center = None
 
     for marker in markers:
 
         if marker.yaw is None:
             continue
 
-        marker_pos = np.array([marker.x, marker.y])
+        marker_pos = np.array(
+            [
+                marker.x,
+                marker.y,
+            ]
+        )
 
         normal = np.array(
             [
@@ -384,11 +404,17 @@ def compute_exit_pose(
             distance_step,
         ):
 
-            candidate = marker_pos - d * normal
+            # Candidate exit position
+            candidate = marker_pos + d * normal
+
             point = ShapelyPoint(*candidate)
 
-            # Stay inside the robot's region
+            # ----------------------------------------------------------
+            # Must be inside region
+            # ----------------------------------------------------------
+
             if allowed_region is not None:
+
                 if not (
                     allowed_region.x
                     <= candidate[0]
@@ -399,26 +425,57 @@ def compute_exit_pose(
                 ):
                     continue
 
-            # Stay off the completed drawing
+                # ------------------------------------------------------
+                # Must not be close to boundary
+                # ------------------------------------------------------
+
+                distance_to_boundary = min(
+                    candidate[0] - allowed_region.x,
+                    allowed_region.x + allowed_region.width - candidate[0],
+                    candidate[1] - allowed_region.y,
+                    allowed_region.y + allowed_region.height - candidate[1],
+                )
+
+                if distance_to_boundary < boundary:
+                    continue
+
+            # ----------------------------------------------------------
+            # Avoid drawing
+            # ----------------------------------------------------------
+
             if drawing.contains(point):
                 continue
 
-            travel = np.linalg.norm(candidate - robot)
+            # ----------------------------------------------------------
+            # Score candidate
+            # ----------------------------------------------------------
 
-            if travel < best_distance:
+            # Prefer close to marker
+            marker_distance = np.linalg.norm(candidate - marker_pos)
+
+            # Prefer center of region
+            if region_center is not None:
+                center_distance = np.linalg.norm(candidate - region_center)
+            else:
+                center_distance = 0
+
+            score = marker_weight * marker_distance + center_weight * center_distance
+
+            if score < best_score:
 
                 heading = math.atan2(
                     marker.y - candidate[1],
                     marker.x - candidate[0],
                 )
 
-                best_distance = travel
+                best_score = score
 
                 best_pose = Pose(
                     x=float(candidate[0]),
                     y=float(candidate[1]),
                     headingDegrees=math.degrees(heading),
                 )
+
 
     return best_pose
 
