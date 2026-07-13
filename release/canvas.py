@@ -45,7 +45,7 @@ from typing import (
     TypeVar,
     cast,
 )
-
+from scipy.ndimage import binary_dilation
 import numpy as np
 from PIL import Image, ImageDraw
 
@@ -410,11 +410,36 @@ class Region:
     def free_fraction(self) -> float:
         return 1.0 - float(self.grid.sum()) / float(self.grid.size)
 
+    def _active_drawings_mask(
+        self, active_drawings: dict[Any, list[Stroke]], radius: int
+    ) -> np.ndarray:
+        """Return a boolean occupancy mask for all active robot drawings."""
+
+        mask = np.zeros_like(self.grid, dtype=bool)
+
+        cell = self.config.cell_mm
+
+        for strokes in active_drawings.values():
+            for stroke in strokes:
+                if len(stroke) < 2:
+                    continue
+
+                for p1, p2 in zip(stroke[:-1], stroke[1:]):
+                    self._rasterize_segment(mask, p1, p2, cell)
+
+        # Keep the robot body (50 mm radius) away from the path.
+        radius_cells = math.ceil(radius / cell)
+        mask = binary_dilation(mask, iterations=radius_cells)
+
+        return mask
+
     def try_place(
         self,
         strokes: Sequence[Stroke],
+        active_drawings: dict[str, List[Stroke]],
         rng: Optional[random.Random] = None,
         footprints: Optional["FootprintCache"] = None,
+        radius: int = 50,
     ) -> Optional[Placement]:
         """Find a collision-free pose (rotation + offset) for ``strokes``, or None.
 
@@ -464,6 +489,10 @@ class Region:
         # FFT of the occupancy grid: computed once and reused for every rotation.
         # An empty region needs no correlation — every offset is free.
         occupied = self.grid.astype(bool)
+
+        if active_drawings is not None:
+            occupied |= self._active_drawings_mask(active_drawing, radius)
+
         grid_fft = (
             np.fft.rfft2(occupied.astype(np.float64), (rows, cols))
             if occupied.any()
@@ -501,6 +530,7 @@ class Region:
             pos = (int(row) * step, int(col) * step)
             if best_key is not None and pos >= best_key:
                 continue  # not closer to the corner than the current best
+
             best_key = pos
             best = self._placement(angle, anchor_local, footprint, pos, cell)
 

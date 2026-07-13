@@ -487,6 +487,7 @@ class _Coordinator:
         self._rng = random.Random(
             seed
         )  # drives scatter placement (deterministic if seeded)
+        self.drawingDictionary: dict[str, list[dict[str, str | list[Stroke]]]] = {}
 
     # -- canvas config ------------------------------------------------------ #
 
@@ -604,13 +605,19 @@ class _Coordinator:
                     staged.navigate_to.headingDegrees,
                 )
                 exit_pose = compute_exit_pose(strokes, canvas.markers, region)
+                self.drawingDictionary[req.name] = strokes
                 return CheckIn.Draw(
                     jobId=staged.job.jobId,
                     navigateTo=staged.navigate_to,
                     commands=staged.commands,
                     exitPose=exit_pose,
                 )
-
+            if (
+                req.status != "ready"
+                and req.status != "drawing"
+                and self.drawingDictionary[req.name] != None
+            ):
+                self.drawingDictionary[req.name] = None
             return CheckIn.Wait()
 
     # -- introspection (admin) ---------------------------------------------- #
@@ -727,6 +734,8 @@ class _Coordinator:
                     heading_deg=staged_angle,
                 )
                 exit_pose = compute_exit_pose(drawing_strokes, canvas.markers, region)
+                if bot.name not in drawingDictionary:
+                    self.drawingDictionary[bot.name] = None
                 self.add_drawing(
                     canvas.id,
                     qj.job.jobId,
@@ -736,6 +745,7 @@ class _Coordinator:
                     qj.heading0,
                     exit_pose,
                 )
+                self.drawingDictionary[bot.name] = drawing_strokes
                 placed = True
                 break
 
@@ -780,6 +790,7 @@ class _Coordinator:
         qj: "_QueuedJob",
         scale_tol: float = 0.02,
         max_iters: int = 12,
+        robot_radius: int = 50,
     ) -> tuple[Optional[Placement], list]:
         """Place the drawing at this region's target footprint size, shrinking only
         if it won't fit. Returns ``(placement, scaled_commands)``.
@@ -813,7 +824,12 @@ class _Coordinator:
         def attempt(s: float) -> tuple[Optional[Placement], list]:
             commands = self.scale_commands(qj.drawing, target * s)
             strokes = self.replay_to_world(commands, 0, 0, qj.heading0)
-            return region.try_place(strokes, rng=self._rng), commands
+            return (
+                region.try_place(
+                    strokes, active_drawings=self.drawingDictionary, rng=self._rng
+                ),
+                commands,
+            )
 
         # Target size first (s = 1.0): the common case on a canvas with free space.
         placement, commands = attempt(1.0)
