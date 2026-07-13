@@ -58,16 +58,22 @@ TRIO_SIZE = 3
 
 # The image model + prompt used to combine a trio into one drawing.
 COMBINE_MODEL = "gpt-image-1"
-COMBINE_PROMPT = (
-    "doodle creatively combining all sketches in one adding elements where the "
-    "flow needs it, use words as inspiration, no words or letters in the drawing. "
-    "Use simple arcs and straight lines to make the doodle."
-    "Pure white background, thin clean black lines only, no fill, no shading, no "
-    "color, no hatching. Style: sparse contour drawing, like a zen brushstroke "
-    "illustration."
-    "Keeo the drawing as minimal as possible. Minimal and less clear is better "
-    "than complicated."
-)
+COMBINE_PROMPT = """\
+doodle creatively combining all sketches into one, adding elements where the \
+flow needs it, use words as inspiration, no words or letters in the drawing. \
+Use simple arcs and straight lines to make the doodle.
+Pure white background, thin clean black lines only, no fill, no shading, no \
+color, no hatching. Style: sparse contour drawing, like a zen brushstroke \
+illustration.
+Keep the drawing as minimal as possible. Minimal and less clear is better \
+than complicated.
+Your doodle will be drawn by a wheeled drawing robot that is only able to \
+draw circular arcs and lines. 
+Circular arcs are preferred, since they only require a single command, \
+while a line effectively requires two commands (one command to spin in place to orient \
+and then the actual line to draw).
+Limit your final drawing to 30 or less shapes (lines + arcs) to allow for fast drawing.
+"""
 
 # Robot dispatch: after vectorization, the drawing is enqueued for a real
 # Doodlebot (see release/robots.py). The client sits in "robot-selection" until
