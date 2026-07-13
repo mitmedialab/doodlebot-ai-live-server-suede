@@ -48,7 +48,7 @@ from pydantic import BaseModel
 from .arc_line_vectorization_suede.visualize import commands_to_svg
 from .combine import Combine
 from .config import COMBINED_DIR
-from .robots import coordinator, enqueue_drawing
+from .robots import DrawingCommand, coordinator, enqueue_drawing, parse_commands
 from .vectorize import run_vectorization
 
 # --- Tunables --------------------------------------------------------------
@@ -109,7 +109,7 @@ class SSEPayload(BaseModel):
     status: SketchStatus | None = None
     companions: list[str] | None = None
     vectorization: str | None = None
-    robot: RobotKind | None = None
+    robot: str | None = None
 
     def encode(self) -> str:
         return self.model_dump_json(exclude_none=True)
@@ -428,7 +428,7 @@ class Manager:
         await self._dispatch_to_robot(trio, commands, source=vectorization_id)
 
     async def _dispatch_to_robot(
-        self, trio: list[Sketch], commands: list[dict], source: str
+        self, trio: list[Sketch], commands: list[DrawingCommand], source: str
     ) -> None:
         """Enqueue the drawing for placement on a ready bot, then poll the
         coordinator until a bot claims it (bounded by ROBOT_ASSIGN_TIMEOUT).
@@ -469,7 +469,7 @@ class Manager:
 
     async def _combine_and_vectorize(
         self, image_paths: list[Path]
-    ) -> tuple[str, list[dict]]:
+    ) -> tuple[str, list[DrawingCommand]]:
         """Run GPT Image 1 over the trio and vectorize the result. Returns the
         served SVG's resource id plus the low-geometry drawing commands (for
         robot dispatch). Retries the whole (network + CPU) chain a couple of
@@ -532,7 +532,7 @@ async def _classify(resource: Resource | None) -> SketchStatus:
 # --- vectorization helper --------------------------------------------------
 
 
-def _vectorize_for_robot_and_svg(png_bytes: bytes) -> tuple[list[dict], str]:
+def _vectorize_for_robot_and_svg(png_bytes: bytes) -> tuple[list[DrawingCommand], str]:
     """Vectorize a combined PNG into the low-geometry (robot-drawn) commands and
     a clean standalone SVG rendered from those same commands.
 
@@ -543,14 +543,18 @@ def _vectorize_for_robot_and_svg(png_bytes: bytes) -> tuple[list[dict], str]:
     pil = Image.open(io.BytesIO(png_bytes))
     pil.load()
     result = run_vectorization(np.asarray(pil))
-    commands = result["low_geometry"]
+    # run_vectorization returns commands as plain JSON-able dicts. commands_to_svg
+    # consumes that dict form directly, but robot dispatch needs the typed
+    # DrawingCommand models (attribute access), so parse them for the return.
+    raw_commands = result["low_geometry"]
     svg = commands_to_svg(
-        commands,
+        raw_commands,
         show_pen_up=False,
         stroke_width=4.0,
         stroke="black",
         show_endpoints=False,
     )
+    commands = parse_commands(raw_commands)
     return commands, svg
 
 
