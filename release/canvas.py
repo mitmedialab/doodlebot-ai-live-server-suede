@@ -463,7 +463,7 @@ class Region:
                 mask[row, col] = True
 
     def _active_drawings_mask(
-        self, active_drawings: dict[Any, list[Stroke]], radius: int
+        self, active_drawings: dict[Any, list[Stroke]], active_buffer: int
     ) -> np.ndarray:
         """Return a boolean occupancy mask for all active robot drawings."""
 
@@ -480,7 +480,7 @@ class Region:
                         for p1, p2 in zip(stroke[:-1], stroke[1:]):
                             self._rasterize_segment(mask, p1, p2, cell)
 
-            radius_cells = math.ceil(radius / cell)
+            active_cells = math.ceil(active_buffer / cell)
 
             original = mask.astype(np.uint8)
 
@@ -488,14 +488,14 @@ class Region:
 
             padded = np.pad(
                 original,
-                radius_cells,
+                active_cells,
                 mode="constant",
                 constant_values=0,
             )
 
             kernel = cv2.getStructuringElement(
                 cv2.MORPH_ELLIPSE,
-                (2 * radius_cells + 1, 2 * radius_cells + 1),
+                (2 * active_cells + 1, 2 * active_cells + 1),
             )
 
             dilated = cv2.dilate(
@@ -505,8 +505,8 @@ class Region:
 
             # Crop back to original size
             mask = dilated[
-                radius_cells : radius_cells + h,
-                radius_cells : radius_cells + w,
+                active_cells : active_cells + h,
+                active_cells : active_cells + w,
             ]
 
         return mask
@@ -515,10 +515,10 @@ class Region:
         self,
         strokes: Sequence[Stroke],
         active_drawings: dict[str, List[Stroke]],
-        buffer: int,
+        general_buffer: int,
+        active_buffer: int,
         rng: Optional[random.Random] = None,
         footprints: Optional["FootprintCache"] = None,
-        radius: int = 500,
     ) -> Optional[Placement]:
         """Find a collision-free pose (rotation + offset) for ``strokes``, or None.
 
@@ -570,7 +570,7 @@ class Region:
         occupied = self.grid.astype(bool)
 
         if active_drawings is not None:
-            occupied |= self._active_drawings_mask(active_drawings, radius)
+            occupied |= self._active_drawings_mask(active_drawings, active_buffer)
 
         grid_fft = (
             np.fft.rfft2(occupied.astype(np.float64), (rows, cols))
@@ -582,7 +582,7 @@ class Region:
         best_key: Optional[tuple[int, int]] = None
 
         for angle in angles:
-            buffer_cells = math.ceil(buffer / self.config.cell_mm)
+            buffer_cells = math.ceil(general_buffer / self.config.cell_mm)
             footprint, anchor_local = footprints.at(angle, cell, half, buffer_cells)
             if footprint is None:
                 return None  # empty drawing — nothing to place at any angle
@@ -686,7 +686,8 @@ class Canvas:
     id: str
     width: float
     height: float
-    buffer: int
+    general_buffer: int
+    active_buffer: int
     markers: list[Marker] = field(default_factory=list)
     regions: list[Region] = field(default_factory=list)
 

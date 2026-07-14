@@ -55,7 +55,9 @@ from release.robots import (  # noqa: E402
 )
 
 VEC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectorizations")
-OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "placement")
+OUT_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "output", "placement"
+)
 
 CANVAS_ID = "test"
 ROBOT = "bot1"
@@ -74,8 +76,14 @@ TARGET_MM = 320.0
 PREPACK_COUNT = 10
 
 _PALETTE = [
-    (31, 119, 180), (255, 127, 14), (44, 160, 44), (148, 103, 189),
-    (140, 86, 75), (227, 119, 194), (23, 190, 207), (188, 189, 34),
+    (31, 119, 180),
+    (255, 127, 14),
+    (44, 160, 44),
+    (148, 103, 189),
+    (140, 86, 75),
+    (227, 119, 194),
+    (23, 190, 207),
+    (188, 189, 34),
 ]
 
 
@@ -100,7 +108,7 @@ def _load_vectorizations() -> list[tuple[str, list[dict]]]:
     return out
 
 
-def _make_canvas(strategy: str) -> CanvasConfig:
+def _make_canvas(strategy: str, general_buffer: int) -> CanvasConfig:
     """One canvas, one full-bleed region owned by ROBOT, so packing is all in one
     grid and trivial to render."""
     return CanvasConfig(
@@ -114,9 +122,13 @@ def _make_canvas(strategy: str) -> CanvasConfig:
             ArucoMarker(id=3, position=Point(x=0.0, y=CANVAS_H)),
         ],
         regions=[
-            RegionConfig(id="full", x=0.0, y=0.0, width=CANVAS_W, height=CANVAS_H, robot=ROBOT)
+            RegionConfig(
+                id="full", x=0.0, y=0.0, width=CANVAS_W, height=CANVAS_H, robot=ROBOT
+            )
         ],
         placement=PlacementSettings(strategy=strategy, targetFootprintMm=TARGET_MM),
+        general_buffer=general_buffer,
+        active_buffer=0,
     )
 
 
@@ -168,7 +180,9 @@ def _render(
         return (margin + p[0] * scale, margin + 16 + p[1] * scale)
 
     draw.text((margin, 4), title, fill=(0, 0, 0))
-    draw.rectangle([to_px((0, 0)), to_px((CANVAS_W, CANVAS_H))], outline=(0, 0, 0), width=2)
+    draw.rectangle(
+        [to_px((0, 0)), to_px((CANVAS_W, CANVAS_H))], outline=(0, 0, 0), width=2
+    )
 
     for i, dr in enumerate(drawings):
         if dr.job_id == highlight_job:
@@ -179,7 +193,9 @@ def _render(
             color, width = _PALETTE[(i - n_packed) % len(_PALETTE)], 2
         for stroke in dr.strokes:
             if len(stroke) >= 2:
-                draw.line([to_px(p) for p in stroke], fill=color, width=width, joint="curve")
+                draw.line(
+                    [to_px(p) for p in stroke], fill=color, width=width, joint="curve"
+                )
         ax, ay = to_px((dr.anchor_x, dr.anchor_y))
         draw.ellipse([ax - 3, ay - 3, ax + 3, ay + 3], fill=color)
 
@@ -202,14 +218,14 @@ def _render_occupancy(path: str, region) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def run_demo(strategy: str, seed: int = 0) -> dict:
+def run_demo(strategy: str, seed: int = 0, general_buffer: int = 0) -> dict:
     vectorizations = _load_vectorizations()
     assert vectorizations, f"no vectorizations found in {VEC_DIR}"
 
     out_dir = os.path.join(OUT_DIR, strategy)
     os.makedirs(out_dir, exist_ok=True)
 
-    coord = _Coordinator([_make_canvas(strategy)], seed=seed)
+    coord = _Coordinator([_make_canvas(strategy, general_buffer)], seed=seed)
     region = coord._store.region_for_robot(ROBOT)
     assert region is not None
 
@@ -225,9 +241,7 @@ def run_demo(strategy: str, seed: int = 0) -> dict:
     # Park the bot as non-ready so the observed jobs stay queued at enqueue time
     # and only place during the drain below (one per ready poll) — that's what
     # lets us snapshot a frame per placement.
-    coord.check_in(
-        CheckIn.Request(name=ROBOT, status="drawing", pose=Pose(x=0, y=0))
-    )
+    coord.check_in(CheckIn.Request(name=ROBOT, status="drawing", pose=Pose(x=0, y=0)))
 
     n_packed = len(_placed(coord))
     _render(
@@ -266,13 +280,26 @@ def run_demo(strategy: str, seed: int = 0) -> dict:
             break
 
     _render(
-        os.path.join(out_dir, "frame_zzz_final.png"),
+        os.path.join(
+            out_dir,
+            f"frame_zzz_final_buffer_{general_buffer:g}.png",
+        ),
         _placed(coord),
         n_packed,
-        title=f"[{strategy}] final: {len(_placed(coord))} drawings, "
-        f"free={region.free_fraction:.0%}",
+        title=(
+            f"[{strategy}] "
+            f"buffer={general_buffer} "
+            f"final: {len(_placed(coord))} drawings, "
+            f"free={region.free_fraction:.0%}"
+        ),
     )
-    _render_occupancy(os.path.join(out_dir, "occupancy_final.png"), region)
+    _render_occupancy(
+        os.path.join(
+            out_dir,
+            f"occupancy_final_buffer_{general_buffer:g}.png",
+        ),
+        region,
+    )
 
     return {
         "strategy": strategy,
@@ -302,10 +329,19 @@ def test_assign_locked_packs_into_full_canvas():
 
 
 if __name__ == "__main__":
+    buffers = [0, 25, 50, 75, 100, 125]
+
     for strategy in ("origin", "scatter"):
-        summary = run_demo(strategy)
-        print(
-            f"[{summary['strategy']}] prepacked={summary['prepacked']} "
-            f"targets_placed={summary['targets_placed']}/{summary['targets']} "
-            f"free={summary['free_fraction']:.1%} -> {summary['out_dir']}"
-        )
+        for general_buffer in buffers:
+            summary = run_demo(
+                strategy=strategy,
+                general_buffer=general_buffer,
+            )
+
+            print(
+                f"[{strategy}] "
+                f"buffer={general_buffer} "
+                f"prepacked={summary['prepacked']} "
+                f"targets_placed={summary['targets_placed']}/{summary['targets']} "
+                f"free={summary['free_fraction']:.1%}"
+            )

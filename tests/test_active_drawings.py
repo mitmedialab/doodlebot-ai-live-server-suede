@@ -68,7 +68,7 @@ def _load_vectorizations() -> list[tuple[str, list[dict]]]:
     return out
 
 
-def _make_canvas(strategy: str) -> CanvasConfig:
+def _make_canvas(strategy: str, active_buffer: int) -> CanvasConfig:
     """A single full-bleed region shared by both robots — no per-robot split."""
     return CanvasConfig(
         id=CANVAS_ID,
@@ -89,18 +89,17 @@ def _make_canvas(strategy: str) -> CanvasConfig:
             ),
         ],
         placement=PlacementSettings(strategy=strategy, targetFootprintMm=TARGET_MM),
-        buffer=0,
+        general_buffer=0,
+        active_buffer=active_buffer,
     )
 
 
 def _checkin(coord, robot, status, pose=(CANVAS_W / 2, CANVAS_H / 2)):
-    print("here?", pose, status)
     resp = coord.check_in(
         CheckIn.Request(
             name=robot, status=status, pose=Pose(x=pose[0], y=pose[1], headingDegrees=0)
         )
     )
-    print("resp", resp)
     return resp
 
 
@@ -160,37 +159,32 @@ def _render(path, drawings, bot1_job_id, title, highlight_job=None):
     img.save(path)
 
 
-def run(strategy: str = "scatter", seed: int = 0):
+def run(strategy: str = "scatter", seed: int = 0, active_buffer: int = 0):
     vectorizations = _load_vectorizations()
-    print("vectorizations", vectorizations)
     assert vectorizations, f"no vectorizations found in {VEC_DIR}"
 
     out_dir = os.path.join(OUT_DIR, strategy)
     os.makedirs(out_dir, exist_ok=True)
 
-    coord = _Coordinator([_make_canvas(strategy)], seed=seed)
-    print("here again")
+    coord = _Coordinator([_make_canvas(strategy, active_buffer)], seed=seed)
     # bot1 gets assigned exactly one drawing — this commits its strokes into
     # the shared region's occupancy grid.
     name0, commands0 = vectorizations[0]
     bot1_job_id = _enqueue(coord, commands0)
-    print("here again 2")
     _checkin(coord, "bot1", "ready")
-    print("here again 3")
     placed_after_bot1 = _placed(coord)
-    print("here")
     assert any(
         dr.job_id == bot1_job_id for dr in placed_after_bot1
     ), "bot1's job never got placed — nothing to test avoidance against"
     bot1_drawing = next(dr for dr in placed_after_bot1 if dr.job_id == bot1_job_id)
     bot1_bbox = _bbox(bot1_drawing)
 
-    _render(
-        os.path.join(out_dir, "frame_000_bot1_assigned.png"),
-        placed_after_bot1,
-        bot1_job_id,
-        title=f"[{strategy}] bot1 assigned {name0} (orange) — occupancy now committed",
-    )
+    # _render(
+
+    #     placed_after_bot1,
+    #     bot1_job_id,
+    #     title=f"[{strategy}] bot1 assigned {name0} (orange) — occupancy now committed",
+    # )
 
     # bot1 stays "drawing" (busy) for the rest of the run — it should not get
     # any further jobs, only bot2 will poll from here on.
@@ -204,13 +198,15 @@ def run(strategy: str = "scatter", seed: int = 0):
         before = len(_placed(coord))
         resp = _checkin(coord, "bot2", "ready")
         after = _placed(coord)
-        print("trying")
         if len(after) > before:
             newest = after[-1]
             overlap = _bboxes_overlap(bot1_bbox, _bbox(newest))
             overlaps.append(overlap)
             _render(
-                os.path.join(out_dir, f"frame_{frame:03d}.png"),
+                os.path.join(
+                    out_dir,
+                    f"final_buffer_{active_buffer:g}.png",
+                ),
                 after,
                 bot1_job_id,
                 title=f"[{strategy}] bot2 placed {name} "
@@ -247,4 +243,6 @@ def test_bot2_avoids_bot1_strokes():
 
 
 if __name__ == "__main__":
-    run("origin")
+    buffers = [0, 50, 100, 200, 500]
+    for active_buffer in buffers:
+        run("origin", active_buffer=active_buffer)

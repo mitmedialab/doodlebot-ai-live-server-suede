@@ -168,7 +168,8 @@ class CanvasConfig(BaseModel):
     id: str
     width: float
     height: float
-    buffer: int
+    general_buffer: int
+    active_buffer: int
     markers: list[ArucoMarker] = []
     regions: list[RegionConfig] = []
     placement: PlacementSettings = PlacementSettings()
@@ -192,7 +193,8 @@ DEFAULT_CANVASES: list[CanvasConfig] = [
             RegionConfig(id="left", x=0.0, y=0.0, width=500.0, height=1000.0),
             RegionConfig(id="right", x=500.0, y=0.0, width=500.0, height=1000.0),
         ],
-        buffer=0,
+        general_buffer=0,
+        active_buffer=50,
     )
 ]
 
@@ -238,7 +240,8 @@ def _build_canvas(cfg: CanvasConfig) -> Canvas:
             )
             for r in cfg.regions
         ],
-        buffer=cfg.buffer,
+        general_buffer=cfg.general_buffer,
+        active_buffer=cfg.active_buffer,
     )
 
 
@@ -716,7 +719,7 @@ class _Coordinator:
                 # rotates the ink for a tighter fit; that rotation rides on the
                 # approach heading, so the drawing commands are sent unchanged.
                 placement, scaled_commands = self._place_scaled(
-                    region, qj, canvas.buffer
+                    region, qj, canvas.general_buffer, canvas.active_buffer
                 )
                 if placement is None:
                     continue  # doesn't fit even at min scale — try another bot
@@ -794,10 +797,10 @@ class _Coordinator:
         self,
         region: Region,
         qj: "_QueuedJob",
-        buffer: int,
+        general_buffer: int,
+        active_buffer: int,
         scale_tol: float = 0.02,
         max_iters: int = 12,
-        robot_radius: int = 50,
     ) -> tuple[Optional[Placement], list]:
         """Place the drawing at this region's target footprint size, shrinking only
         if it won't fit. Returns ``(placement, scaled_commands)``.
@@ -836,7 +839,8 @@ class _Coordinator:
                     strokes,
                     active_drawings=self.drawingDictionary,
                     rng=self._rng,
-                    buffer=buffer,
+                    general_buffer=general_buffer,
+                    active_buffer=active_buffer,
                 ),
                 commands,
             )
