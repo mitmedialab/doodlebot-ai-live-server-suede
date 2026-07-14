@@ -491,7 +491,7 @@ class Region:
         buffer: int,
         rng: Optional[random.Random] = None,
         footprints: Optional["FootprintCache"] = None,
-        radius: int = 0,
+        radius: int = 50,
     ) -> Optional[Placement]:
         """Find a collision-free pose (rotation + offset) for ``strokes``, or None.
 
@@ -542,8 +542,8 @@ class Region:
         # An empty region needs no correlation — every offset is free.
         occupied = self.grid.astype(bool)
 
-        # if active_drawings is not None:
-        #     occupied |= self._active_drawings_mask(active_drawings, radius)
+        if active_drawings is not None:
+            occupied |= self._active_drawings_mask(active_drawings, radius)
 
         grid_fft = (
             np.fft.rfft2(occupied.astype(np.float64), (rows, cols))

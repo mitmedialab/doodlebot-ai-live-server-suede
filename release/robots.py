@@ -741,8 +741,7 @@ class _Coordinator:
                     heading_deg=staged_angle,
                 )
                 exit_pose = compute_exit_pose(drawing_strokes, canvas.markers, region)
-                if bot.name not in self.drawingDictionary:
-                    self.drawingDictionary[bot.name] = None
+
                 self.add_drawing(
                     canvas.id,
                     qj.job.jobId,
