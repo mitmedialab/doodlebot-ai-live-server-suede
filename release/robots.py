@@ -168,6 +168,7 @@ class CanvasConfig(BaseModel):
     id: str
     width: float
     height: float
+    buffer: int
     markers: list[ArucoMarker] = []
     regions: list[RegionConfig] = []
     placement: PlacementSettings = PlacementSettings()
@@ -191,6 +192,7 @@ DEFAULT_CANVASES: list[CanvasConfig] = [
             RegionConfig(id="left", x=0.0, y=0.0, width=500.0, height=1000.0),
             RegionConfig(id="right", x=500.0, y=0.0, width=500.0, height=1000.0),
         ],
+        buffer=0,
     )
 ]
 
@@ -236,6 +238,7 @@ def _build_canvas(cfg: CanvasConfig) -> Canvas:
             )
             for r in cfg.regions
         ],
+        buffer=cfg.buffer,
     )
 
 
@@ -589,6 +592,13 @@ class _Coordinator:
                 record.status = req.status
                 record.last_seen = now
 
+            if req.name not in self.drawingDictionary:
+                self.drawingDictionary[req.name] = None
+            if (
+                req.status == "ready" or req.status == "locating"
+            ) and self.drawingDictionary[req.name] != None:
+                self.drawingDictionary[req.name] = None
+
             self._assign_locked()
 
             region = self._store.region_for_robot(req.name)
@@ -612,12 +622,7 @@ class _Coordinator:
                     commands=staged.commands,
                     exitPose=exit_pose,
                 )
-            if (
-                req.status != "ready"
-                and req.status != "drawing"
-                and self.drawingDictionary[req.name] != None
-            ):
-                self.drawingDictionary[req.name] = None
+
             return CheckIn.Wait()
 
     # -- introspection (admin) ---------------------------------------------- #
@@ -710,7 +715,9 @@ class _Coordinator:
                 # the target only as far as needed if it won't fit here. The search
                 # rotates the ink for a tighter fit; that rotation rides on the
                 # approach heading, so the drawing commands are sent unchanged.
-                placement, scaled_commands = self._place_scaled(region, qj)
+                placement, scaled_commands = self._place_scaled(
+                    region, qj, canvas.buffer
+                )
                 if placement is None:
                     continue  # doesn't fit even at min scale — try another bot
 
@@ -734,7 +741,7 @@ class _Coordinator:
                     heading_deg=staged_angle,
                 )
                 exit_pose = compute_exit_pose(drawing_strokes, canvas.markers, region)
-                if bot.name not in drawingDictionary:
+                if bot.name not in self.drawingDictionary:
                     self.drawingDictionary[bot.name] = None
                 self.add_drawing(
                     canvas.id,
@@ -788,6 +795,7 @@ class _Coordinator:
         self,
         region: Region,
         qj: "_QueuedJob",
+        buffer: int,
         scale_tol: float = 0.02,
         max_iters: int = 12,
         robot_radius: int = 50,
@@ -826,7 +834,10 @@ class _Coordinator:
             strokes = self.replay_to_world(commands, 0, 0, qj.heading0)
             return (
                 region.try_place(
-                    strokes, active_drawings=self.drawingDictionary, rng=self._rng
+                    strokes,
+                    active_drawings=self.drawingDictionary,
+                    rng=self._rng,
+                    buffer=buffer,
                 ),
                 commands,
             )

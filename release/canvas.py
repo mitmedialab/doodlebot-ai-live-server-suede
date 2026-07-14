@@ -369,13 +369,25 @@ class FootprintCache:
         ] = {}
 
     def at(
-        self, angle: float, cell_mm: float, half_width_cells: int
+        self, angle: float, cell_mm: float, half_width_cells: int, buffer_cells: int
     ) -> tuple[Optional[Footprint], Optional[Point]]:
         key = (angle, cell_mm, half_width_cells)
         hit = self._cache.get(key)
         if hit is None:
             rotated = rotate_strokes(self._strokes, angle)
             footprint = rasterize(rotated, cell_mm, half_width_cells)
+            # footprint.mask = binary_dilation(
+            #     footprint.mask,
+            #     iterations=buffer_cells,
+            # )
+            r = buffer_cells
+            y, x = np.ogrid[-r : r + 1, -r : r + 1]
+            disk = x * x + y * y <= r * r
+
+            footprint.mask = binary_dilation(
+                footprint.mask,
+                structure=disk,
+            )
             anchor = rotated[0][0] if footprint is not None else None
             hit = (footprint, anchor)
             self._cache[key] = hit
@@ -410,26 +422,65 @@ class Region:
     def free_fraction(self) -> float:
         return 1.0 - float(self.grid.sum()) / float(self.grid.size)
 
+    def _rasterize_segment(
+        self,
+        mask: np.ndarray,
+        p1: Point,
+        p2: Point,
+        cell: float,
+    ) -> None:
+        """Rasterize a line segment into a boolean occupancy grid."""
+
+        x0 = p1[0] / cell
+        y0 = p1[1] / cell
+        x1 = p2[0] / cell
+        y1 = p2[1] / cell
+
+        # Sample roughly every half cell.
+        dist = math.hypot(x1 - x0, y1 - y0)
+        n = max(1, int(math.ceil(dist * 2)))
+
+        for i in range(n + 1):
+            t = i / n
+            x = x0 + t * (x1 - x0)
+            y = y0 + t * (y1 - y0)
+
+            col = int(round(x))
+            row = int(round(y))
+
+            if 0 <= row < mask.shape[0] and 0 <= col < mask.shape[1]:
+                mask[row, col] = True
+
     def _active_drawings_mask(
         self, active_drawings: dict[Any, list[Stroke]], radius: int
     ) -> np.ndarray:
         """Return a boolean occupancy mask for all active robot drawings."""
 
         mask = np.zeros_like(self.grid, dtype=bool)
+        if active_drawings:
+            cell = self.config.cell_mm
 
-        cell = self.config.cell_mm
+            for strokes in active_drawings.values():
+                if strokes:
+                    for stroke in strokes:
+                        if len(stroke) < 2:
+                            continue
 
-        for strokes in active_drawings.values():
-            for stroke in strokes:
-                if len(stroke) < 2:
-                    continue
+                        for p1, p2 in zip(stroke[:-1], stroke[1:]):
+                            self._rasterize_segment(mask, p1, p2, cell)
 
-                for p1, p2 in zip(stroke[:-1], stroke[1:]):
-                    self._rasterize_segment(mask, p1, p2, cell)
+            radius_cells = math.ceil(radius / cell)
 
-        # Keep the robot body (50 mm radius) away from the path.
-        radius_cells = math.ceil(radius / cell)
-        mask = binary_dilation(mask, iterations=radius_cells)
+            y, x = np.ogrid[
+                -radius_cells : radius_cells + 1,
+                -radius_cells : radius_cells + 1,
+            ]
+            disk = x * x + y * y <= radius_cells * radius_cells
+
+            mask = binary_dilation(
+                mask,
+                structure=disk,
+            )
 
         return mask
 
@@ -437,9 +488,10 @@ class Region:
         self,
         strokes: Sequence[Stroke],
         active_drawings: dict[str, List[Stroke]],
+        buffer: int,
         rng: Optional[random.Random] = None,
         footprints: Optional["FootprintCache"] = None,
-        radius: int = 50,
+        radius: int = 0,
     ) -> Optional[Placement]:
         """Find a collision-free pose (rotation + offset) for ``strokes``, or None.
 
@@ -490,8 +542,8 @@ class Region:
         # An empty region needs no correlation — every offset is free.
         occupied = self.grid.astype(bool)
 
-        if active_drawings is not None:
-            occupied |= self._active_drawings_mask(active_drawing, radius)
+        # if active_drawings is not None:
+        #     occupied |= self._active_drawings_mask(active_drawings, radius)
 
         grid_fft = (
             np.fft.rfft2(occupied.astype(np.float64), (rows, cols))
@@ -503,7 +555,8 @@ class Region:
         best_key: Optional[tuple[int, int]] = None
 
         for angle in angles:
-            footprint, anchor_local = footprints.at(angle, cell, half)
+            buffer_cells = math.ceil(buffer / self.config.cell_mm)
+            footprint, anchor_local = footprints.at(angle, cell, half, buffer_cells)
             if footprint is None:
                 return None  # empty drawing — nothing to place at any angle
             assert anchor_local is not None  # set together with footprint
@@ -557,6 +610,7 @@ class Region:
 
     def commit(self, placement: Placement) -> None:
         """Stamp a placed footprint into the occupancy grid (reserves the space)."""
+
         mask = placement._footprint.mask
         mh, mw = mask.shape
         top, left = placement._top, placement._left
@@ -604,6 +658,7 @@ class Canvas:
     id: str
     width: float
     height: float
+    buffer: int
     markers: list[Marker] = field(default_factory=list)
     regions: list[Region] = field(default_factory=list)
 
