@@ -45,9 +45,10 @@ from typing import (
     TypeVar,
     cast,
 )
-from scipy.ndimage import binary_dilation
+
 import numpy as np
 from PIL import Image, ImageDraw
+import cv2
 
 # --------------------------------------------------------------------------- #
 # Command protocol (duck-typed against robots.py's pydantic models)
@@ -376,18 +377,28 @@ class FootprintCache:
         if hit is None:
             rotated = rotate_strokes(self._strokes, angle)
             footprint = rasterize(rotated, cell_mm, half_width_cells)
-            # footprint.mask = binary_dilation(
-            #     footprint.mask,
-            #     iterations=buffer_cells,
-            # )
-            r = buffer_cells
-            y, x = np.ogrid[-r : r + 1, -r : r + 1]
-            disk = x * x + y * y <= r * r
 
-            footprint.mask = binary_dilation(
-                footprint.mask,
-                structure=disk,
+            original = footprint.mask.astype(np.uint8)
+
+            padded = np.pad(
+                original,
+                buffer_cells,
+                mode="constant",
+                constant_values=0,
             )
+
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (2 * buffer_cells + 1, 2 * buffer_cells + 1),
+            )
+
+            dilated = cv2.dilate(
+                padded,
+                kernel,
+            ).astype(bool)
+
+            footprint.mask = dilated
+
             anchor = rotated[0][0] if footprint is not None else None
             hit = (footprint, anchor)
             self._cache[key] = hit
@@ -471,16 +482,32 @@ class Region:
 
             radius_cells = math.ceil(radius / cell)
 
-            y, x = np.ogrid[
-                -radius_cells : radius_cells + 1,
-                -radius_cells : radius_cells + 1,
-            ]
-            disk = x * x + y * y <= radius_cells * radius_cells
+            original = mask.astype(np.uint8)
 
-            mask = binary_dilation(
-                mask,
-                structure=disk,
+            h, w = original.shape
+
+            padded = np.pad(
+                original,
+                radius_cells,
+                mode="constant",
+                constant_values=0,
             )
+
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (2 * radius_cells + 1, 2 * radius_cells + 1),
+            )
+
+            dilated = cv2.dilate(
+                padded,
+                kernel,
+            ).astype(bool)
+
+            # Crop back to original size
+            mask = dilated[
+                radius_cells : radius_cells + h,
+                radius_cells : radius_cells + w,
+            ]
 
         return mask
 
@@ -491,7 +518,7 @@ class Region:
         buffer: int,
         rng: Optional[random.Random] = None,
         footprints: Optional["FootprintCache"] = None,
-        radius: int = 50,
+        radius: int = 500,
     ) -> Optional[Placement]:
         """Find a collision-free pose (rotation + offset) for ``strokes``, or None.
 
@@ -561,6 +588,7 @@ class Region:
                 return None  # empty drawing — nothing to place at any angle
             assert anchor_local is not None  # set together with footprint
             mask = footprint.mask
+
             mh, mw = mask.shape
             if mh > rows or mw > cols:
                 continue  # this rotation can't fit in the region at all
