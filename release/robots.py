@@ -195,6 +195,7 @@ class CanvasConfig(BaseModel):
     markers: list[ArucoMarker] = []
     regions: list[RegionConfig] = []
     placement: PlacementSettings = PlacementSettings()
+    drawings: list[StrokeConfig] = []
 
 
 # Default canvas layout. In a real deployment this is measured per-venue; defined
@@ -215,6 +216,7 @@ DEFAULT_CANVASES: list[CanvasConfig] = [
             RegionConfig(id="left", x=0.0, y=0.0, width=500.0, height=1000.0),
             RegionConfig(id="right", x=500.0, y=0.0, width=500.0, height=1000.0),
         ],
+        drawings=[],
     )
 ]
 
@@ -565,26 +567,28 @@ class _Coordinator:
     def set_canvas(self, cfg: CanvasConfig) -> None:
         with self._lock:
             self._store.upsert(_build_canvas(cfg))
+            self.insert_drawings(cfg.id, cfg.drawings)
 
-    def add_occupancy(self, canvas_id: str, drawings: List[StrokeConfig]) -> None:
-        with self._lock:
+    def insert_drawings(self, canvas_id: str, drawings: list[StrokeConfig]) -> None:
+        if canvas_id not in self._drawings:
             self._drawings[canvas_id] = []
+        for drawing in drawings:
+            placedDrawing = PlacedDrawing(
+                job_id=drawing.job_id,
+                anchor_x=drawing.anchor_x,
+                anchor_y=drawing.anchor_y,
+                angle_deg=drawing.angle_deg,
+                strokes=drawing.strokes,
+                commands=[],
+                robot_name=drawing.robot_name,
+                exit_pose_x=drawing.exit_pose_x,
+                exit_pose_y=drawing.exit_pose_y,
+                exit_pose_deg=drawing.exit_pose_deg,
+            )
+            self._drawings[canvas_id].append(placedDrawing)
             canvas = self._store.get(canvas_id)
-            for s in drawings:
-                placedDrawing = PlacedDrawing(
-                    job_id=s.job_id,
-                    anchor_x=s.anchor_x,
-                    anchor_y=s.anchor_y,
-                    angle_deg=s.angle_deg,
-                    strokes=s.strokes,
-                    robot_name=s.robot_name,
-                    exit_pose_x=s.exit_pose_x,
-                    exit_pose_y=s.exit_pose_y,
-                    exit_pose_deg=s.exit_pose_deg,
-                )
-                self._drawings[canvas_id].push(placedDrawing)
-                region = canvas.region_for_robot(s.robot_name)
-                region.add_drawings([s])
+            region = canvas.region_for_robot(drawing.robot_name)
+            region.add_drawings([placedDrawing])
 
     def remove_canvas(self, canvas_id: str) -> None:
         with self._lock:
