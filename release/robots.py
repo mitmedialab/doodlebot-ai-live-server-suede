@@ -163,6 +163,7 @@ class RegionConfig(BaseModel):
     width: float
     height: float
     robot: Optional[str] = None  # the robot name assigned to draw this region
+    color: Optional[str] = "#000"
 
 
 class StrokeConfig(BaseModel):
@@ -256,6 +257,7 @@ def _build_canvas(cfg: CanvasConfig) -> Canvas:
                 width=r.width,
                 height=r.height,
                 robot=r.robot,
+                color=r.color,
                 config=placement,
             )
             for r in cfg.regions
@@ -1120,6 +1122,7 @@ async def get_canvases(request: Request) -> Canvases:
                         width=r.width,
                         height=r.height,
                         robot=r.robot,
+                        color=r.color,
                     )
                     for r in c.regions
                 ],
