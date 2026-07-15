@@ -126,6 +126,7 @@ class SSEPayload(BaseModel):
     companions: list[str] | None = None
     vectorization: str | None = None
     robot: str | None = None
+    color: str | None = None
 
     def encode(self) -> str:
         return self.model_dump_json(exclude_none=True)
@@ -489,6 +490,7 @@ class Manager:
         assigned: str | None = None
         while True:
             assigned = coordinator.assigned_robot(job.jobId)
+            color = coordinator.color_for_robot(assigned)
             if assigned is not None:
                 break
             if ROBOT_ASSIGN_TIMEOUT and waited >= ROBOT_ASSIGN_TIMEOUT:
@@ -505,7 +507,9 @@ class Manager:
 
         for sketch in trio:
             sketch.state = "complete"
-            self._emit(sketch, SSEPayload(sketch=sketch.id, robot=assigned))
+            self._emit(
+                sketch, SSEPayload(sketch=sketch.id, robot=assigned, color=color)
+            )
 
     async def _combine_and_vectorize(
         self, resources: list[StoredResource]
