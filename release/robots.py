@@ -566,6 +566,26 @@ class _Coordinator:
         with self._lock:
             self._store.upsert(_build_canvas(cfg))
 
+    def add_occupancy(self, canvas_id: str, drawings: List[StrokeConfig]) -> None:
+        with self._lock:
+            self._drawings[canvas_id] = []
+            canvas = self._store.get(canvas_id)
+            for s in drawings:
+                placedDrawing = PlacedDrawing(
+                    job_id=s.job_id,
+                    anchor_x=s.anchor_x,
+                    anchor_y=s.anchor_y,
+                    angle_deg=s.angle_deg,
+                    strokes=s.strokes,
+                    robot_name=s.robot_name,
+                    exit_pose_x=s.exit_pose_x,
+                    exit_pose_y=s.exit_pose_y,
+                    exit_pose_deg=s.exit_pose_deg,
+                )
+                self._drawings[canvas_id].push(placedDrawing)
+                region = canvas.region_for_robot(s.robot_name)
+                region.add_drawings([s])
+
     def remove_canvas(self, canvas_id: str) -> None:
         with self._lock:
             self._store.remove(canvas_id)
@@ -1175,6 +1195,17 @@ async def post_canvas(payload: CanvasConfig, request: Request) -> CanvasConfig:
     require_admin(request)
     coordinator.set_canvas(payload)
     print(f"[robots] canvas '{payload.id}' configured ({len(payload.regions)} regions)")
+    return payload
+
+
+@router.post("/api/robots/canvases/occupancy")
+async def add_occupancy(
+    payload: list[StrokeConfig], request: Request
+) -> list[StrokeConfig]:
+    """Admin: register or replace a canvas definition (resets its occupancy)."""
+    require_admin(request)
+    coordinator.add_occupancy(payload)
+    print(f"[robots] canvas '{payload.id}' drawings added")
     return payload
 
 
