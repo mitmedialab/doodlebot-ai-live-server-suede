@@ -165,18 +165,6 @@ class RegionConfig(BaseModel):
     robot: Optional[str] = None  # the robot name assigned to draw this region
 
 
-class StrokeConfig(BaseModel):
-    job_id: str
-    robot_name: str
-    anchor_x: float
-    anchor_y: float
-    angle_deg: float
-    strokes: list
-    exit_pose_x: float
-    exit_pose_y: float
-    exit_pose_deg: float
-
-
 class PlacementSettings(BaseModel):
     cellMm: float = 2.0
     penMm: float = 3.0
@@ -195,7 +183,7 @@ class CanvasConfig(BaseModel):
     markers: list[ArucoMarker] = []
     regions: list[RegionConfig] = []
     placement: PlacementSettings = PlacementSettings()
-    drawings: list[StrokeConfig] = []
+    drawings: list[PlacedDrawing] = []
 
 
 # Default canvas layout. In a real deployment this is measured per-venue; defined
@@ -569,7 +557,7 @@ class _Coordinator:
             self._store.upsert(_build_canvas(cfg))
             self.insert_drawings(cfg.id, cfg.drawings)
 
-    def insert_drawings(self, canvas_id: str, drawings: list[StrokeConfig]) -> None:
+    def insert_drawings(self, canvas_id: str, drawings: list[PlacedDrawing]) -> None:
         if canvas_id not in self._drawings:
             self._drawings[canvas_id] = []
         for drawing in drawings:
@@ -579,7 +567,7 @@ class _Coordinator:
                 anchor_y=drawing.anchor_y,
                 angle_deg=drawing.angle_deg,
                 strokes=drawing.strokes,
-                commands=[],
+                commands=drawing.commands,
                 robot_name=drawing.robot_name,
                 exit_pose_x=drawing.exit_pose_x,
                 exit_pose_y=drawing.exit_pose_y,
@@ -1104,7 +1092,7 @@ class Canvases(BaseModel):
         height: float
         markers: list[ArucoMarker]
         regions: list[RegionConfig]
-        drawings: list[StrokeConfig]
+        drawings: list[PlacedDrawing]
         freeFractionByRegion: dict[str, float]
 
     canvases: list["Canvases.Item"]
@@ -1148,12 +1136,13 @@ async def get_canvases(request: Request) -> Canvases:
                     for r in c.regions
                 ],
                 drawings=[
-                    StrokeConfig(
+                    PlacedDrawing(
                         job_id=s.job_id,
                         anchor_x=s.anchor_x,
                         anchor_y=s.anchor_y,
                         angle_deg=s.angle_deg,
                         strokes=s.strokes,
+                        commands=s.commands,
                         robot_name=s.robot_name,
                         exit_pose_x=s.exit_pose_x,
                         exit_pose_y=s.exit_pose_y,
@@ -1199,17 +1188,6 @@ async def post_canvas(payload: CanvasConfig, request: Request) -> CanvasConfig:
     require_admin(request)
     coordinator.set_canvas(payload)
     print(f"[robots] canvas '{payload.id}' configured ({len(payload.regions)} regions)")
-    return payload
-
-
-@router.post("/api/robots/canvases/occupancy")
-async def add_occupancy(
-    payload: list[StrokeConfig], request: Request
-) -> list[StrokeConfig]:
-    """Admin: register or replace a canvas definition (resets its occupancy)."""
-    require_admin(request)
-    coordinator.add_occupancy(payload)
-    print(f"[robots] canvas '{payload.id}' drawings added")
     return payload
 
 
