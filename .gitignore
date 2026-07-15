@@ -1,3 +1,4 @@
+.env
 **/*.png
 **/*.gif
 **/__pycache__

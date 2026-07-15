@@ -37,7 +37,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator, Literal
+from typing import AsyncIterator, Literal, Coroutine, Any
 
 import numpy as np
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -72,7 +72,7 @@ draw circular arcs and lines.
 Circular arcs are preferred, since they only require a single command, \
 while a line effectively requires two commands (one command to spin in place to orient \
 and then the actual line to draw).
-Limit your final drawing to 30 or less shapes (lines + arcs) to allow for fast drawing.
+Limit your final drawing to 20 or less shapes (individual lines + arcs) to allow for extra fast drawing.
 """
 
 # Robot dispatch: after vectorization, the drawing is enqueued for a real
@@ -510,7 +510,7 @@ class Manager:
 
     # -- task bookkeeping ---------------------------------------------------
 
-    def _spawn(self, coro) -> None:
+    def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
         task = asyncio.ensure_future(coro)
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
