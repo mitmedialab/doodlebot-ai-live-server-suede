@@ -43,11 +43,14 @@ from typing import (
     Sequence,
     TypeAlias,
     TypeVar,
+    Tuple,
     cast,
 )
 
 import numpy as np
+import numpy.typing as npt
 from PIL import Image, ImageDraw
+from scipy.fft import next_fast_len
 import cv2
 
 # --------------------------------------------------------------------------- #
@@ -82,6 +85,26 @@ CommandT = TypeVar("CommandT", bound=Command)
 
 Point = tuple[float, float]
 Stroke = list[Point]  # a contiguous pen-down polyline, in drawing-local mm
+
+BoolMask: TypeAlias = npt.NDArray[np.bool_]
+"""A boolean raster over grid cells — ``True`` = covered/blocked.
+
+Footprint masks, keep-out maps and free-offset maps are all this shape of thing;
+they differ in what they're indexed by, which the parameter names carry.
+"""
+
+Grid: TypeAlias = npt.NDArray[np.uint8]
+"""A region's committed occupancy grid: 0/1 per cell.
+
+``uint8`` rather than ``bool`` because ``commit`` stamps footprints in with
+``|=`` and callers treat it as counts-adjacent (``grid.sum()``).
+"""
+
+Spectrum: TypeAlias = npt.NDArray[np.complex128]
+"""Half-spectrum of a real 2-D grid, as returned by ``np.fft.rfft2``.
+
+``complex128`` (not ``complex64``) is load-bearing — see ``_free_offsets``.
+"""
 
 
 # --------------------------------------------------------------------------- #
@@ -207,7 +230,7 @@ def split_lead_in(
 
 @dataclass
 class Footprint:
-    mask: np.ndarray  # boolean, shape (rows, cols) — True = covered
+    mask: BoolMask  # shape (rows, cols) — True = covered
     min_x: float  # local-mm coords of the mask's (0,0) cell corner
     min_y: float
     pad: int
@@ -223,7 +246,7 @@ class Footprint:
 
 def rasterize(
     strokes: Sequence[Stroke], cell_mm: float, half_width_cells: int
-) -> Optional[Footprint]:
+) -> Footprint:
     """Rasterize pen-down strokes into a dilated boolean mask.
 
     ``half_width_cells`` is half the drawn line thickness in cells — i.e. the
@@ -232,9 +255,6 @@ def rasterize(
     """
 
     pts = [p for stroke in strokes for p in stroke]
-    if not pts:
-        return None
-
     xs = [p[0] for p in pts]
     ys = [p[1] for p in pts]
     min_x, min_y = min(xs), min(ys)
@@ -261,7 +281,7 @@ def rasterize(
             r = half_width_cells
             draw.ellipse([px - r, py - r, px + r, py + r], fill=1)
 
-    mask = np.array(img, dtype=bool)
+    mask: BoolMask = np.array(img, dtype=np.bool_)
     return Footprint(mask=mask, min_x=min_x, min_y=min_y, pad=pad, cell_mm=cell_mm)
 
 
@@ -323,9 +343,33 @@ class Placement:
     _footprint: Footprint
 
 
+def _fft_shape(grid_shape: tuple[int, int]) -> tuple[int, int]:
+    """Transform size to use for a grid of ``grid_shape`` — the next FFT-friendly size.
+
+    An FFT is only fast when its length factors into small primes; a prime length
+    degrades toward the O(n²) DFT. Grid sizes here are ``ceil(width_mm / cell_mm)``
+    — an arbitrary integer chosen by whoever posted the canvas — so they land on
+    hostile lengths regularly (a 1000mm canvas at 1.5mm cells gives 667 = 23·29,
+    which transforms ~2x slower than the 675 next to it). Rounding *up* to a
+    5-smooth length costs a little zero-padding and buys that back.
+
+    Padding is safe for the wraparound argument in ``_free_offsets``: enlarging the
+    period only adds zeros past the grid, and the valid offsets we read back
+    (``t <= rows - mh``) stay well inside the un-aliased range.
+    """
+
+    return (
+        next_fast_len(grid_shape[0], real=True),  # type: ignore
+        next_fast_len(grid_shape[1], real=True),
+    )
+
+
 def _free_offsets(
-    grid_fft: np.ndarray, mask: np.ndarray, grid_shape: tuple[int, int]
-) -> np.ndarray:
+    grid_fft: Spectrum,
+    mask: BoolMask,
+    grid_shape: tuple[int, int],
+    fft_shape: tuple[int, int],
+) -> BoolMask:
     """Boolean map of collision-free top-left offsets, via FFT cross-correlation.
 
     ``corr[t, l]`` is the number of occupied cells the footprint would overlap if
@@ -336,18 +380,32 @@ def _free_offsets(
 
     — replacing the per-position sweep that used to dominate the runtime. Overlap
     counts are integers, so a free cell is exactly where ``corr`` rounds to zero
-    (``< 0.5`` absorbs FFT floating-point error). ``grid_fft`` is precomputed once
-    per placement and reused across rotations (only the mask changes per angle).
+    (``< 0.5`` absorbs FFT floating-point error — which is also why this stays in
+    float64: the transform's DC term runs to ~1e8 here, and float32's epsilon
+    against that is far wider than the 0.5 the threshold allows).
+
+    ``grid_fft`` is precomputed once per placement and reused across rotations
+    (only the mask changes per angle); it must have been transformed at
+    ``fft_shape``, which ``_fft_shape`` derives from ``grid_shape``.
 
     Returns an array over valid top-left offsets, shape
     ``(rows - mh + 1, cols - mw + 1)``; ``True`` means that offset is collision-free.
     """
     rows, cols = grid_shape
     mh, mw = mask.shape
-    mask_fft = np.fft.rfft2(mask.astype(np.float64), (rows, cols))
-    corr = np.fft.irfft2(grid_fft * np.conj(mask_fft), (rows, cols))
+    mask_fft = np.fft.rfft2(mask.astype(np.float64), fft_shape)
+    corr = np.fft.irfft2(grid_fft * np.conj(mask_fft), fft_shape)
     valid = corr[: rows - mh + 1, : cols - mw + 1]
     return valid < 0.5
+
+
+FootprintCacheKey: TypeAlias = tuple[
+    float, float, int
+]  # (angle, cell_mm, half_width_cells)
+
+FootprintCacheValue: TypeAlias = tuple[
+    Optional[Footprint], Optional[Point]
+]  # (footprint, first-ink point)
 
 
 class FootprintCache:
@@ -364,45 +422,33 @@ class FootprintCache:
 
     def __init__(self, strokes: Sequence[Stroke]) -> None:
         self._strokes = strokes
-        # (angle, cell_mm, half) -> (footprint, first-ink point), both None if empty
-        self._cache: dict[
-            tuple[float, float, int], tuple[Optional[Footprint], Optional[Point]]
-        ] = {}
+        self._cache: dict[FootprintCacheKey, FootprintCacheValue] = {}
 
     def at(
-        self, angle: float, cell_mm: float, half_width_cells: int, buffer_cells: int
+        self, angle: float, cell_mm: float, half_width_cells: int
     ) -> tuple[Optional[Footprint], Optional[Point]]:
-        key = (angle, cell_mm, half_width_cells)
+        """Rotated footprint at ``angle``, covering the ink only.
+
+        The general keep-out buffer is *not* applied here — it's dilated onto the
+        occupancy map instead (see ``Region.compute_occupancy``), which is the same
+        clearance for one dilation per placement rather than one per rotation. It
+        also keeps ``Region.commit`` stamping bare ink into the grid, so the buffer
+        stays a property of the test rather than something baked into the region.
+        """
+        key = self._key(angle, cell_mm, half_width_cells)
         hit = self._cache.get(key)
         if hit is None:
             rotated = rotate_strokes(self._strokes, angle)
             footprint = rasterize(rotated, cell_mm, half_width_cells)
-
-            original = footprint.mask.astype(np.uint8)
-
-            padded = np.pad(
-                original,
-                buffer_cells,
-                mode="constant",
-                constant_values=0,
-            )
-
-            kernel = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE,
-                (2 * buffer_cells + 1, 2 * buffer_cells + 1),
-            )
-
-            dilated = cv2.dilate(
-                padded,
-                kernel,
-            ).astype(bool)
-
-            footprint.mask = dilated
-
-            anchor = rotated[0][0] if footprint is not None else None
+            anchor = rotated[0][0]
             hit = (footprint, anchor)
             self._cache[key] = hit
         return hit
+
+    def _key(
+        self, angle: float, cell_mm: float, half_width_cells: int
+    ) -> FootprintCacheKey:
+        return (angle, cell_mm, half_width_cells)
 
 
 # --------------------------------------------------------------------------- #
@@ -422,7 +468,7 @@ class Region:
     robot: Optional[str] = None
     config: PlacementConfig = field(default_factory=PlacementConfig)
 
-    grid: np.ndarray = field(init=False)
+    grid: Grid = field(init=False)
 
     def __post_init__(self) -> None:
         cols = max(1, int(math.ceil(self.width / self.config.cell_mm)))
@@ -433,90 +479,52 @@ class Region:
     def free_fraction(self) -> float:
         return 1.0 - float(self.grid.sum()) / float(self.grid.size)
 
-    def _rasterize_segment(
-        self,
-        mask: np.ndarray,
-        p1: Point,
-        p2: Point,
-        cell: float,
-    ) -> None:
-        """Rasterize a line segment into a boolean occupancy grid."""
+    def compute_occupancy(self, *, general_buffer: int) -> BoolMask:
+        """Snapshot this region's grid as the keep-out map ``try_place`` tests against.
 
-        x0 = p1[0] / cell
-        y0 = p1[1] / cell
-        x1 = p2[0] / cell
-        y1 = p2[1] / cell
+        The committed grid holds bare ink; ``general_buffer`` (mm) is the keep-out
+        margin every new drawing must leave around it. Growing the *occupied* side
+        by that margin is equivalent to growing each candidate footprint by it
+        (Minkowski sum), but costs one dilation per placement instead of one per
+        candidate rotation — hence ``try_place`` takes the result rather than
+        deriving it.
 
-        # Sample roughly every half cell.
-        dist = math.hypot(x1 - x0, y1 - y0)
-        n = max(1, int(math.ceil(dist * 2)))
+        Returns a boolean array the same shape as ``self.grid`` (region-grid cells,
+        ``True`` = keep out), so it drops straight into the FFT correlation.
+        """
 
-        for i in range(n + 1):
-            t = i / n
-            x = x0 + t * (x1 - x0)
-            y = y0 + t * (y1 - y0)
+        occupied: BoolMask = self.grid.astype(np.bool_)
 
-            col = int(round(x))
-            row = int(round(y))
+        buffer_cells = math.ceil(general_buffer / self.config.cell_mm)
+        if buffer_cells <= 0 or not occupied.any():
+            return occupied
 
-            if 0 <= row < mask.shape[0] and 0 <= col < mask.shape[1]:
-                mask[row, col] = True
+        h, w = occupied.shape
 
-    def _active_drawings_mask(
-        self, active_drawings: dict[Any, list[Stroke]], active_buffer: int
-    ) -> np.ndarray:
-        """Return a boolean occupancy mask for all active robot drawings."""
+        padded = np.pad(
+            occupied.astype(np.uint8),
+            buffer_cells,
+            mode="constant",
+            constant_values=0,
+        )
 
-        mask = np.zeros_like(self.grid, dtype=bool)
-        if active_drawings:
-            cell = self.config.cell_mm
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE,
+            (2 * buffer_cells + 1, 2 * buffer_cells + 1),
+        )
 
-            for strokes in active_drawings.values():
-                if strokes:
-                    for stroke in strokes:
-                        if len(stroke) < 2:
-                            continue
+        # cv2 is untyped here, so pin the result back to a known dtype rather than
+        # letting Any leak into the return.
+        dilated: BoolMask = cv2.dilate(padded, kernel).astype(np.bool_)
 
-                        for p1, p2 in zip(stroke[:-1], stroke[1:]):
-                            self._rasterize_segment(mask, p1, p2, cell)
-
-            active_cells = math.ceil(active_buffer / cell)
-
-            original = mask.astype(np.uint8)
-
-            h, w = original.shape
-
-            padded = np.pad(
-                original,
-                active_cells,
-                mode="constant",
-                constant_values=0,
-            )
-
-            kernel = cv2.getStructuringElement(
-                cv2.MORPH_ELLIPSE,
-                (2 * active_cells + 1, 2 * active_cells + 1),
-            )
-
-            dilated = cv2.dilate(
-                padded,
-                kernel,
-            ).astype(bool)
-
-            # Crop back to original size
-            mask = dilated[
-                active_cells : active_cells + h,
-                active_cells : active_cells + w,
-            ]
-
-        return mask
+        # Crop back to the region grid: the buffer only pushes drawings apart from
+        # each other, it doesn't extend the region's own bounds.
+        return dilated[buffer_cells : buffer_cells + h, buffer_cells : buffer_cells + w]
 
     def try_place(
         self,
         strokes: Sequence[Stroke],
-        active_drawings: dict[str, List[Stroke]],
-        general_buffer: int,
-        active_buffer: int,
+        occupancy: BoolMask,
         rng: Optional[random.Random] = None,
         footprints: Optional["FootprintCache"] = None,
     ) -> Optional[Placement]:
@@ -529,6 +537,13 @@ class Region:
         when rotating buys nothing); ``scatter`` picks a uniformly random free
         offset for an organic spread. ``search_step_cells`` subsamples the offset
         grid (coarser = faster, fewer candidate positions).
+
+        ``occupancy`` is the keep-out map from ``compute_occupancy`` — a boolean
+        array over this region's grid cells, already grown by the general buffer.
+        It's a required argument rather than something derived here because a
+        single placement runs this search many times (once per rotation, and
+        repeatedly while binary-searching the drawing's scale), and the map is
+        identical across all of them.
 
         ``footprints`` is an optional ``FootprintCache`` for the drawing; the same
         queued drawing is re-tested across polls and candidate bots, and its
@@ -555,6 +570,12 @@ class Region:
         step = max(1, self.config.search_step_cells)
         rows, cols = self.grid.shape
 
+        if occupancy.shape != self.grid.shape:
+            raise ValueError(
+                f"occupancy shape {occupancy.shape} does not match region "
+                f"{self.id!r} grid shape {self.grid.shape}"
+            )
+
         if footprints is None:
             footprints = FootprintCache(strokes)
 
@@ -567,14 +588,10 @@ class Region:
 
         # FFT of the occupancy grid: computed once and reused for every rotation.
         # An empty region needs no correlation — every offset is free.
-        occupied = self.grid.astype(bool)
-
-        if active_drawings is not None:
-            occupied |= self._active_drawings_mask(active_drawings, active_buffer)
-
-        grid_fft = (
-            np.fft.rfft2(occupied.astype(np.float64), (rows, cols))
-            if occupied.any()
+        fft_shape = _fft_shape((rows, cols))
+        grid_fft: Optional[Spectrum] = (
+            np.fft.rfft2(occupancy.astype(np.float64), fft_shape)
+            if occupancy.any()
             else None
         )
 
@@ -582,8 +599,7 @@ class Region:
         best_key: Optional[tuple[int, int]] = None
 
         for angle in angles:
-            buffer_cells = math.ceil(general_buffer / self.config.cell_mm)
-            footprint, anchor_local = footprints.at(angle, cell, half, buffer_cells)
+            footprint, anchor_local = footprints.at(angle, cell, half)
             if footprint is None:
                 return None  # empty drawing — nothing to place at any angle
             assert anchor_local is not None  # set together with footprint
@@ -594,9 +610,9 @@ class Region:
                 continue  # this rotation can't fit in the region at all
 
             if grid_fft is None:
-                free = np.ones((rows - mh + 1, cols - mw + 1), dtype=bool)
+                free = np.ones((rows - mh + 1, cols - mw + 1), dtype=np.bool_)
             else:
-                free = _free_offsets(grid_fft, mask, (rows, cols))
+                free = _free_offsets(grid_fft, mask, (rows, cols), fft_shape)
 
             coords = np.argwhere(free[::step, ::step])  # row-major: corner-first
             if coords.size == 0:
@@ -614,6 +630,14 @@ class Region:
 
             best_key = pos
             best = self._placement(angle, anchor_local, footprint, pos, cell)
+
+            if best_key == (0, 0):
+                # Nothing beats the corner itself, and a later angle that merely
+                # ties loses to the `pos >= best_key` test above anyway — so the
+                # remaining rotations cannot change the answer. Mostly this is the
+                # empty-region case, where every angle is free at (0,0) and we'd
+                # otherwise rasterize all of them to learn nothing.
+                break
 
         return best
 

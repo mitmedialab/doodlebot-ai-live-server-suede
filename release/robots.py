@@ -820,12 +820,6 @@ class _Coordinator:
         a hard backstop.
         """
 
-        strokes = self.replay_to_world(
-            qj.drawing,
-            0,
-            0,
-            qj.heading0,
-        )
         if qj.native_span <= 0:
             return None, qj.drawing
         min_scale = region.config.min_footprint_scale
