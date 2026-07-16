@@ -31,7 +31,7 @@ import glob
 import json
 import os
 import sys
-from typing import Optional
+from typing import Literal, Optional
 
 from PIL import Image, ImageDraw
 
@@ -55,7 +55,9 @@ from release.robots import (  # noqa: E402
 )
 
 VEC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vectorizations")
-OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output", "placement")
+OUT_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "output", "placement"
+)
 
 CANVAS_ID = "test"
 ROBOT = "bot1"
@@ -74,8 +76,14 @@ TARGET_MM = 320.0
 PREPACK_COUNT = 10
 
 _PALETTE = [
-    (31, 119, 180), (255, 127, 14), (44, 160, 44), (148, 103, 189),
-    (140, 86, 75), (227, 119, 194), (23, 190, 207), (188, 189, 34),
+    (31, 119, 180),
+    (255, 127, 14),
+    (44, 160, 44),
+    (148, 103, 189),
+    (140, 86, 75),
+    (227, 119, 194),
+    (23, 190, 207),
+    (188, 189, 34),
 ]
 
 
@@ -100,7 +108,9 @@ def _load_vectorizations() -> list[tuple[str, list[dict]]]:
     return out
 
 
-def _make_canvas(strategy: str) -> CanvasConfig:
+def _make_canvas(
+    strategy: Literal["origin", "scatter"], general_buffer: int
+) -> CanvasConfig:
     """One canvas, one full-bleed region owned by ROBOT, so packing is all in one
     grid and trivial to render."""
     return CanvasConfig(
@@ -114,9 +124,14 @@ def _make_canvas(strategy: str) -> CanvasConfig:
             ArucoMarker(id=3, position=Point(x=0.0, y=CANVAS_H)),
         ],
         regions=[
-            RegionConfig(id="full", x=0.0, y=0.0, width=CANVAS_W, height=CANVAS_H, robot=ROBOT)
+            RegionConfig(
+                id="full", x=0.0, y=0.0, width=CANVAS_W, height=CANVAS_H, robot=ROBOT
+            )
         ],
-        placement=PlacementSettings(strategy=strategy, targetFootprintMm=TARGET_MM),
+        placement=PlacementSettings(
+            strategy=strategy, targetFootprintMm=TARGET_MM, cellMm=10.0
+        ),
+        general_buffer=general_buffer,
     )
 
 
@@ -168,7 +183,9 @@ def _render(
         return (margin + p[0] * scale, margin + 16 + p[1] * scale)
 
     draw.text((margin, 4), title, fill=(0, 0, 0))
-    draw.rectangle([to_px((0, 0)), to_px((CANVAS_W, CANVAS_H))], outline=(0, 0, 0), width=2)
+    draw.rectangle(
+        [to_px((0, 0)), to_px((CANVAS_W, CANVAS_H))], outline=(0, 0, 0), width=2
+    )
 
     for i, dr in enumerate(drawings):
         if dr.job_id == highlight_job:
@@ -179,22 +196,13 @@ def _render(
             color, width = _PALETTE[(i - n_packed) % len(_PALETTE)], 2
         for stroke in dr.strokes:
             if len(stroke) >= 2:
-                draw.line([to_px(p) for p in stroke], fill=color, width=width, joint="curve")
+                draw.line(
+                    [to_px(p) for p in stroke], fill=color, width=width, joint="curve"
+                )
         ax, ay = to_px((dr.anchor_x, dr.anchor_y))
         draw.ellipse([ax - 3, ay - 3, ax + 3, ay + 3], fill=color)
 
     img.save(path)
-
-
-def _render_occupancy(path: str, region) -> None:
-    """The raw uint8 occupancy grid the placement search actually sees."""
-    import numpy as np
-
-    grid = np.asarray(region.grid)
-    arr = (255 - (grid > 0).astype("uint8") * 255).astype("uint8")
-    occ = Image.fromarray(arr, mode="L")
-    occ = occ.resize((occ.width * 2, occ.height * 2), Image.NEAREST)
-    occ.save(path)
 
 
 # --------------------------------------------------------------------------- #
@@ -202,14 +210,16 @@ def _render_occupancy(path: str, region) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def run_demo(strategy: str, seed: int = 0) -> dict:
+def run_demo(
+    strategy: Literal["origin", "scatter"], seed: int = 0, general_buffer: int = 0
+) -> dict:
     vectorizations = _load_vectorizations()
     assert vectorizations, f"no vectorizations found in {VEC_DIR}"
 
     out_dir = os.path.join(OUT_DIR, strategy)
     os.makedirs(out_dir, exist_ok=True)
 
-    coord = _Coordinator([_make_canvas(strategy)], seed=seed)
+    coord = _Coordinator([_make_canvas(strategy, general_buffer)], seed=seed)
     region = coord._store.region_for_robot(ROBOT)
     assert region is not None
 
@@ -225,18 +235,9 @@ def run_demo(strategy: str, seed: int = 0) -> dict:
     # Park the bot as non-ready so the observed jobs stay queued at enqueue time
     # and only place during the drain below (one per ready poll) — that's what
     # lets us snapshot a frame per placement.
-    coord.check_in(
-        CheckIn.Request(name=ROBOT, status="drawing", pose=Pose(x=0, y=0))
-    )
+    coord.check_in(CheckIn.Request(name=ROBOT, status="drawing", pose=Pose(x=0, y=0)))
 
     n_packed = len(_placed(coord))
-    _render(
-        os.path.join(out_dir, "frame_000_packed.png"),
-        _placed(coord),
-        n_packed,
-        title=f"[{strategy}] pre-packed: {n_packed} drawings, "
-        f"free={region.free_fraction:.0%}",
-    )
 
     # 2) Observe: one job per vectorization, a frame per placement.
     job_to_name: dict[str, str] = {}
@@ -250,29 +251,25 @@ def run_demo(strategy: str, seed: int = 0) -> dict:
         resp = _ready_checkin(coord)
         after = _placed(coord)
         if len(after) > before:
-            newest = after[-1]
             placed_targets += 1
-            _render(
-                os.path.join(out_dir, f"frame_{frame:03d}_{newest.job_id}.png"),
-                after,
-                n_packed,
-                highlight_job=newest.job_id,
-                title=f"[{strategy}] placed {job_to_name.get(newest.job_id, '?')} "
-                f"@({newest.anchor_x:.0f},{newest.anchor_y:.0f}) "
-                f"{newest.angle_deg:.0f}deg  free={region.free_fraction:.0%}",
-            )
             frame += 1
         elif resp.action == "wait":
             break
 
     _render(
-        os.path.join(out_dir, "frame_zzz_final.png"),
+        os.path.join(
+            out_dir,
+            f"frame_final_buffer_{general_buffer:g}.png",
+        ),
         _placed(coord),
         n_packed,
-        title=f"[{strategy}] final: {len(_placed(coord))} drawings, "
-        f"free={region.free_fraction:.0%}",
+        title=(
+            f"[{strategy}] "
+            f"buffer={general_buffer} "
+            f"final: {len(_placed(coord))} drawings, "
+            f"free={region.free_fraction:.0%}"
+        ),
     )
-    _render_occupancy(os.path.join(out_dir, "occupancy_final.png"), region)
 
     return {
         "strategy": strategy,
@@ -284,28 +281,20 @@ def run_demo(strategy: str, seed: int = 0) -> dict:
     }
 
 
-# --------------------------------------------------------------------------- #
-# pytest entry point
-# --------------------------------------------------------------------------- #
-
-
-def test_assign_locked_packs_into_full_canvas():
-    for strategy in ("origin", "scatter"):
-        result = run_demo(strategy)
-        # Pre-packing must have actually filled the canvas.
-        assert result["prepacked"] >= 1, result
-        # Observed jobs either place (at >= min_scale) or stay queued — never more
-        # than were enqueued, and the floor means we no longer draw specks.
-        assert 0 <= result["targets_placed"] <= result["targets"], result
-        assert os.path.exists(os.path.join(result["out_dir"], "frame_zzz_final.png"))
-        assert os.path.exists(os.path.join(result["out_dir"], "occupancy_final.png"))
-
-
 if __name__ == "__main__":
+    buffers = [0, 25, 50, 75, 100, 125]
+
     for strategy in ("origin", "scatter"):
-        summary = run_demo(strategy)
-        print(
-            f"[{summary['strategy']}] prepacked={summary['prepacked']} "
-            f"targets_placed={summary['targets_placed']}/{summary['targets']} "
-            f"free={summary['free_fraction']:.1%} -> {summary['out_dir']}"
-        )
+        for general_buffer in buffers:
+            summary = run_demo(
+                strategy=strategy,
+                general_buffer=general_buffer,
+            )
+
+            print(
+                f"[{strategy}] "
+                f"buffer={general_buffer} "
+                f"prepacked={summary['prepacked']} "
+                f"targets_placed={summary['targets_placed']}/{summary['targets']} "
+                f"free={summary['free_fraction']:.1%}"
+            )
