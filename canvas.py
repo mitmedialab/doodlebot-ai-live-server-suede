@@ -1340,14 +1340,6 @@ class Canvas:
     general_buffer: float
     """mm of clearance to leave between separate drawings."""
 
-    active_buffer: int
-    """Unused by placement.
-
-    A robot mid-drawing is kept away from by modelling its ``RobotBody``, not by a
-    configured margin — see ``Region._active_robot_keepout``. Retained so existing
-    canvas configs keep validating; nothing reads it.
-    """
-
     markers: list[Marker] = field(default_factory=list)
     regions: list[Region] = field(default_factory=list)
 
