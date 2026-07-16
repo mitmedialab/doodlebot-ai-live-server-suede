@@ -490,7 +490,6 @@ class Manager:
         assigned: str | None = None
         while True:
             assigned = coordinator.assigned_robot(job.jobId)
-            color = coordinator.color_for_robot(assigned)
             if assigned is not None:
                 break
             if ROBOT_ASSIGN_TIMEOUT and waited >= ROBOT_ASSIGN_TIMEOUT:
@@ -504,12 +503,19 @@ class Manager:
 
         if assigned is not None:
             print(f"[v2] {job.jobId} claimed by robot '{assigned}'")
-
-        for sketch in trio:
-            sketch.state = "complete"
-            self._emit(
-                sketch, SSEPayload(sketch=sketch.id, robot=assigned, color=color)
-            )
+            for sketch in trio:
+                sketch.state = "complete"
+                color = coordinator.color_for_robot(assigned)
+                self._emit(
+                    sketch, SSEPayload(sketch=sketch.id, robot=assigned, color=color)
+                )
+        else:
+            for sketch in trio:
+                sketch.state = "complete"
+                self._emit(
+                    sketch,
+                    SSEPayload(sketch=sketch.id, robot="<invalid>"),
+                )
 
     async def _combine_and_vectorize(
         self, resources: list[StoredResource]

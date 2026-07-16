@@ -763,12 +763,10 @@ class _Coordinator:
                         return placed.robot_name
             return None
 
-    def color_for_robot(self, robot_name: str | None) -> Optional[str]:
-        if robot_name:
-            region = self._store.region_for_robot(robot_name)
-            return region.color
-        else:
-            return None
+    def color_for_robot(self, robot_name: str) -> str:
+        region = self._store.region_for_robot(robot_name)
+        color = region.color if region is not None else "#FF0000"
+        return color if color is not None else "#FF0000"
 
     # -- internals ---------------------------------------------------------- #
 
