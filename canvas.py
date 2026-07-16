@@ -724,6 +724,7 @@ class Region:
     width: float
     height: float
     robot: Optional[str] = None
+    color: Optional[str] = "#000"
     config: PlacementConfig = field(default_factory=PlacementConfig)
 
     grid: Grid = field(init=False)
