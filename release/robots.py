@@ -30,10 +30,20 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 import math
-from typing import Annotated, Literal, Optional, Sequence, TypeAlias, Union
+from typing import (
+    Annotated,
+    Any,
+    Iterable,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    TypeAlias,
+    Union,
+)
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
 
 from dataclasses import replace
 
@@ -100,6 +110,21 @@ class ArcCommand(BaseModel):
 DrawingCommand: TypeAlias = Annotated[
     Union[LineCommand, SpinCommand, ArcCommand], Field(discriminator="kind")
 ]
+
+
+_DRAWING_COMMANDS_ADAPTER = TypeAdapter(list[DrawingCommand])
+
+
+def parse_commands(raw: Iterable[Mapping[str, Any]]) -> list[DrawingCommand]:
+    """Validate raw vectorizer command dicts into the typed discriminated-union
+    models the coordinator consumes.
+
+    The vectorizer (``release/vectorize.py``) emits commands as plain JSON-able
+    dicts (its ``DrawingCommand`` *TypedDict*). The coordinator reaches into
+    commands by attribute (``cmd.kind``, ``cmd.distance``, ...), so those dicts
+    must be parsed into the Pydantic ``DrawingCommand`` models here before
+    dispatch — don't rely on ``DrawingJob`` coercing them implicitly."""
+    return _DRAWING_COMMANDS_ADAPTER.validate_python(list(raw))
 
 
 class ArucoMarker(BaseModel):
@@ -370,7 +395,7 @@ class _RobotRecord:
 def compute_exit_pose(
     strokes,
     markers: list[Marker],
-    allowed_region: Region | None = None,
+    allowed_region: Region,
     robot_radius: float = 80,
     min_marker_distance: float = 100,
     max_marker_distance: float = 1000,
@@ -380,7 +405,7 @@ def compute_exit_pose(
     center_weight: float = 1.0,
     drawing_weight: float = 2.0,
     debug_plot: bool = False,
-) -> Pose | None:
+) -> Pose:
 
     # Original drawing (used for distance scoring)
     drawing_lines = unary_union(
@@ -495,7 +520,41 @@ def compute_exit_pose(
                     y=float(candidate[1]),
                     headingDegrees=math.degrees(heading),
                 )
-    return best_pose
+    if best_pose is not None:
+        return best_pose
+
+    print(
+        f"Unable to compute best pose for region: {allowed_region.id}, robot: {allowed_region.robot}. Computing default."
+    )
+
+    # ------------------------------------------------------------------
+    # Fallback: no candidate survived the region / collision / scoring
+    # filters (e.g. the drawing fills the region, or no marker had a
+    # usable yaw). Default to the center of the allowed region, facing
+    # the nearest marker — mirroring the primary loop's heading, which
+    # always points from the pose back toward a marker.
+    # ------------------------------------------------------------------
+    fallback_center = region_center if region_center is not None else robot
+
+    heading_degrees = 0.0
+    if markers:
+        nearest = min(
+            markers,
+            key=lambda m: (m.x - fallback_center[0]) ** 2
+            + (m.y - fallback_center[1]) ** 2,
+        )
+        heading_degrees = math.degrees(
+            math.atan2(
+                nearest.y - fallback_center[1],
+                nearest.x - fallback_center[0],
+            )
+        )
+
+    return Pose(
+        x=float(fallback_center[0]),
+        y=float(fallback_center[1]),
+        headingDegrees=heading_degrees,
+    )
 
 
 class _Coordinator:
@@ -645,6 +704,11 @@ class _Coordinator:
             canvas = self._store.canvas_for_robot(req.name)
 
             if canvas is None:
+                print(f"ERROR: No canvas for robot {req.name}")
+                return CheckIn.Wait()
+
+            if region is None:
+                print(f"ERROR: No region for robot {req.name}")
                 return CheckIn.Wait()
 
             if req.status == "ready" and record.staged is not None:
@@ -690,6 +754,24 @@ class _Coordinator:
                     )
                 )
             return RobotPool(bots=bots, queuedJobs=len(self._queue))
+
+    def assigned_robot(self, job_id: str) -> Optional[str]:
+        """The name of the robot a queued job has landed on, or None if it's
+        still waiting for a bot (or unknown).
+
+        A job counts as assigned once it's either staged on a bot (a placement
+        was found and the bot will collect it on its next check-in) or already
+        recorded as a placed drawing. Callers (e.g. the v2 pipeline) poll this to
+        learn when a real Doodlebot has taken the drawing."""
+        with self._lock:
+            for record in self._robots.values():
+                if record.staged is not None and record.staged.job.jobId == job_id:
+                    return record.name
+            for placed_list in self._drawings.values():
+                for placed in placed_list:
+                    if placed.job_id == job_id:
+                        return placed.robot_name
+            return None
 
     # -- internals ---------------------------------------------------------- #
 
@@ -754,7 +836,9 @@ class _Coordinator:
         # within their own canvas.
         contexts: dict[tuple[str, str], canvas_engine.PlacementContext] = {}
 
-        def context_for(region: Region, canvas: Canvas) -> canvas_engine.PlacementContext:
+        def context_for(
+            region: Region, canvas: Canvas
+        ) -> canvas_engine.PlacementContext:
             key = (canvas.id, region.id)
             context = contexts.get(key)
             if context is None:

@@ -23,13 +23,17 @@ from . import (
     combine,
     vectorize,
     robots,
+    v2,
 )
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://mitmedialab.github.io"],
+    allow_origins=[
+        "https://mitmedialab.github.io",
+        "http://localhost:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,6 +50,7 @@ for module in (
     combine,
     vectorize,
     robots,
+    v2,
 ):
     app.include_router(module.router)
 
