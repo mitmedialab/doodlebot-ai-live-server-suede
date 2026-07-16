@@ -28,9 +28,9 @@ import random
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
-from typing import Annotated, Literal, Optional, TypeAlias, Union
+from typing import Annotated, Literal, Optional, Sequence, TypeAlias, Union
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -154,8 +154,8 @@ class StrokeConfig(BaseModel):
 
 
 class PlacementSettings(BaseModel):
-    cellMm: float = 2.0
-    penMm: float = 3.0
+    cellMm: float = 5.0
+    penMm: float = 5.0
     clearanceMm: float = 8.0
     searchStepCells: int = 2
     angleStepDeg: float = 15.0  # rotations tried = 0, step, 2·step, … < 360
@@ -168,8 +168,8 @@ class CanvasConfig(BaseModel):
     id: str
     width: float
     height: float
-    general_buffer: int
-    active_buffer: int
+    general_buffer: float = 0.0  # mm of clearance between separate drawings
+    active_buffer: int = 0  # unused by placement; see Canvas.active_buffer
     markers: list[ArucoMarker] = []
     regions: list[RegionConfig] = []
     placement: PlacementSettings = PlacementSettings()
@@ -336,6 +336,26 @@ class _QueuedJob:
     heading0: float
     native_span: float
 
+    _footprints: dict[float, canvas_engine.FootprintCache] = field(default_factory=dict)
+    """Rotated, rasterized footprints, keyed by the absolute scale they were built at.
+
+    A queued drawing is re-tested against every ready bot on every poll, and the
+    scales it gets tried at are deterministic (the target, then a fixed bisection),
+    so the same rotations get rasterized over and over. Keyed by absolute scale
+    rather than by region, so two regions that size a drawing the same way share the
+    work. Lives and dies with the job.
+    """
+
+    def footprints_at(
+        self, scale: float, strokes: Sequence[canvas_engine.Stroke]
+    ) -> canvas_engine.FootprintCache:
+        key = round(scale, 6)
+        cache = self._footprints.get(key)
+        if cache is None:
+            cache = canvas_engine.FootprintCache(strokes)
+            self._footprints[key] = cache
+        return cache
+
 
 @dataclass
 class _RobotRecord:
@@ -493,7 +513,7 @@ class _Coordinator:
         self._rng = random.Random(
             seed
         )  # drives scatter placement (deterministic if seeded)
-        self.drawingDictionary: dict[str, list[dict[str, str | list[Stroke]]]] = {}
+        self.drawingDictionary: dict[str, list[Stroke]] = {}
 
     # -- canvas config ------------------------------------------------------ #
 
@@ -594,18 +614,21 @@ class _Coordinator:
                 record.pose = req.pose
                 record.status = req.status
                 record.last_seen = now
-
-            if req.name not in self.drawingDictionary:
-                self.drawingDictionary[req.name] = None
-            if (
-                req.status == "ready" or req.status == "locating"
-            ) and self.drawingDictionary[req.name] != None:
-                self.drawingDictionary[req.name] = None
+            if req.status == "ready" or req.status == "locating":
+                # Not drawing any more, so stop treating it as a live obstacle.
+                # ``pop`` with a default rather than indexing: a bot that has never
+                # drawn has no entry at all, and checking in is the first thing it
+                # ever does.
+                self.drawingDictionary.pop(req.name, None)
 
             self._assign_locked()
 
             region = self._store.region_for_robot(req.name)
             canvas = self._store.canvas_for_robot(req.name)
+
+            if canvas is None:
+                return CheckIn.Wait()
+
             if req.status == "ready" and record.staged is not None:
                 staged = record.staged
                 record.staged = None
@@ -694,6 +717,25 @@ class _Coordinator:
         if not self._queue:
             return
 
+        # One prepared snapshot per region, reused for every job and every candidate
+        # bot in this pass. Building it costs an occupancy dilation, an FFT and the
+        # neighbours' body sweep, and none of that depends on the drawing being
+        # placed — so the only thing that may invalidate it is the region's ink or
+        # the set of live drawings changing, both of which happen only when we
+        # commit. See ``_invalidate`` below.
+        contexts: dict[str, canvas_engine.PlacementContext] = {}
+
+        def context_for(region: Region, canvas) -> canvas_engine.PlacementContext:
+            context = contexts.get(region.id)
+            if context is None:
+                context = region.prepare(
+                    general_buffer=canvas.general_buffer,
+                    canvas=canvas,
+                    active_drawings=self.drawingDictionary,
+                )
+                contexts[region.id] = context
+            return context
+
         still_queued: deque[_QueuedJob] = deque()
         while self._queue:
             qj = self._queue.popleft()
@@ -719,13 +761,12 @@ class _Coordinator:
                 # rotates the ink for a tighter fit; that rotation rides on the
                 # approach heading, so the drawing commands are sent unchanged.
                 placement, scaled_commands = self._place_scaled(
-                    region, qj, canvas.general_buffer, canvas.active_buffer
+                    region, qj, context_for(region, canvas)
                 )
                 if placement is None:
-                    continue  # doesn't fit even at min scale — try another bot
+                    continue  # won't fit even at min scale — try another bot
 
                 region.commit(placement)
-                print(scaled_commands)
 
                 staged_angle = qj.heading0 + placement.angle_deg
                 bot.staged = _StagedJob(
@@ -755,6 +796,14 @@ class _Coordinator:
                     exit_pose,
                 )
                 self.drawingDictionary[bot.name] = drawing_strokes
+
+                # This bot is now a live obstacle for every region that shares an
+                # edge with its own, and its region has new ink — so every cached
+                # snapshot is potentially stale. Dropping all of them is the honest
+                # move: a snapshot that outlives what it describes places a drawing
+                # on top of one we just committed.
+                contexts.clear()
+
                 placed = True
                 break
 
@@ -797,13 +846,19 @@ class _Coordinator:
         self,
         region: Region,
         qj: "_QueuedJob",
-        general_buffer: int,
-        active_buffer: int,
+        context: canvas_engine.PlacementContext,
         scale_tol: float = 0.02,
         max_iters: int = 12,
     ) -> tuple[Optional[Placement], list]:
         """Place the drawing at this region's target footprint size, shrinking only
         if it won't fit. Returns ``(placement, scaled_commands)``.
+
+        ``context`` is the region's prepared snapshot (occupancy, its FFT, and the
+        live neighbours' bodies). It's passed in rather than built here because this
+        method runs up to ``max_iters + 1`` searches and every one of them would
+        otherwise rebuild it — none of it depends on the drawing or its scale. The
+        caller owns it, and must rebuild it whenever the region's ink or the live
+        drawings change.
 
         The base scale ``target = target_footprint_mm / native_span`` sizes the
         drawing (uniformly, so aspect ratio is kept and the longest side hits the
@@ -826,15 +881,15 @@ class _Coordinator:
         target = region.config.target_footprint_mm / qj.native_span
 
         def attempt(s: float) -> tuple[Optional[Placement], list]:
-            commands = self.scale_commands(qj.drawing, target * s)
+            scale = target * s
+            commands = self.scale_commands(qj.drawing, scale)
             strokes = self.replay_to_world(commands, 0, 0, qj.heading0)
             return (
                 region.try_place(
                     strokes,
-                    active_drawings=self.drawingDictionary,
+                    context,
                     rng=self._rng,
-                    general_buffer=general_buffer,
-                    active_buffer=active_buffer,
+                    footprints=qj.footprints_at(scale, strokes),
                 ),
                 commands,
             )
@@ -849,12 +904,6 @@ class _Coordinator:
         best: Optional[Placement] = None
         best_commands: list = qj.drawing
         iters = 0
-        strokes = self.replay_to_world(
-            qj.drawing,
-            0,
-            0,
-            qj.heading0,
-        )
         while hi - lo > scale_tol and iters < max_iters:
             iters += 1
             mid = (lo + hi) / 2.0
@@ -873,7 +922,7 @@ class _Coordinator:
         commands: list,
         placement: Placement,
         heading0: float,
-        exit_pose: Pose,
+        exit_pose: Pose | None,
     ) -> None:
         # The reserved footprint is the ink at orientation ``heading0 + angle``
         # (the lead-in heading baked into the strokes, plus the placement search's

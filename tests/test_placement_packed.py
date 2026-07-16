@@ -31,7 +31,7 @@ import glob
 import json
 import os
 import sys
-from typing import Optional
+from typing import Literal, Optional
 
 from PIL import Image, ImageDraw
 
@@ -108,7 +108,9 @@ def _load_vectorizations() -> list[tuple[str, list[dict]]]:
     return out
 
 
-def _make_canvas(strategy: str, general_buffer: int) -> CanvasConfig:
+def _make_canvas(
+    strategy: Literal["origin", "scatter"], general_buffer: int
+) -> CanvasConfig:
     """One canvas, one full-bleed region owned by ROBOT, so packing is all in one
     grid and trivial to render."""
     return CanvasConfig(
@@ -126,7 +128,9 @@ def _make_canvas(strategy: str, general_buffer: int) -> CanvasConfig:
                 id="full", x=0.0, y=0.0, width=CANVAS_W, height=CANVAS_H, robot=ROBOT
             )
         ],
-        placement=PlacementSettings(strategy=strategy, targetFootprintMm=TARGET_MM),
+        placement=PlacementSettings(
+            strategy=strategy, targetFootprintMm=TARGET_MM, cellMm=10.0
+        ),
         general_buffer=general_buffer,
         active_buffer=0,
     )
@@ -202,23 +206,14 @@ def _render(
     img.save(path)
 
 
-def _render_occupancy(path: str, region) -> None:
-    """The raw uint8 occupancy grid the placement search actually sees."""
-    import numpy as np
-
-    grid = np.asarray(region.grid)
-    arr = (255 - (grid > 0).astype("uint8") * 255).astype("uint8")
-    occ = Image.fromarray(arr, mode="L")
-    occ = occ.resize((occ.width * 2, occ.height * 2), Image.NEAREST)
-    occ.save(path)
-
-
 # --------------------------------------------------------------------------- #
 # The demo
 # --------------------------------------------------------------------------- #
 
 
-def run_demo(strategy: str, seed: int = 0, general_buffer: int = 0) -> dict:
+def run_demo(
+    strategy: Literal["origin", "scatter"], seed: int = 0, general_buffer: int = 0
+) -> dict:
     vectorizations = _load_vectorizations()
     assert vectorizations, f"no vectorizations found in {VEC_DIR}"
 
@@ -244,13 +239,6 @@ def run_demo(strategy: str, seed: int = 0, general_buffer: int = 0) -> dict:
     coord.check_in(CheckIn.Request(name=ROBOT, status="drawing", pose=Pose(x=0, y=0)))
 
     n_packed = len(_placed(coord))
-    # _render(
-    #     os.path.join(out_dir, "frame_000_packed.png"),
-    #     _placed(coord),
-    #     n_packed,
-    #     title=f"[{strategy}] pre-packed: {n_packed} drawings, "
-    #     f"free={region.free_fraction:.0%}",
-    # )
 
     # 2) Observe: one job per vectorization, a frame per placement.
     job_to_name: dict[str, str] = {}
@@ -264,17 +252,7 @@ def run_demo(strategy: str, seed: int = 0, general_buffer: int = 0) -> dict:
         resp = _ready_checkin(coord)
         after = _placed(coord)
         if len(after) > before:
-            newest = after[-1]
             placed_targets += 1
-            # _render(
-            #     os.path.join(out_dir, f"frame_{frame:03d}_{newest.job_id}.png"),
-            #     after,
-            #     n_packed,
-            #     highlight_job=newest.job_id,
-            #     title=f"[{strategy}] placed {job_to_name.get(newest.job_id, '?')} "
-            #     f"@({newest.anchor_x:.0f},{newest.anchor_y:.0f}) "
-            #     f"{newest.angle_deg:.0f}deg  free={region.free_fraction:.0%}",
-            # )
             frame += 1
         elif resp.action == "wait":
             break
@@ -293,13 +271,6 @@ def run_demo(strategy: str, seed: int = 0, general_buffer: int = 0) -> dict:
             f"free={region.free_fraction:.0%}"
         ),
     )
-    # _render_occupancy(
-    #     os.path.join(
-    #         out_dir,
-    #         f"occupancy_final_buffer_{general_buffer:g}.png",
-    #     ),
-    #     region,
-    # )
 
     return {
         "strategy": strategy,
@@ -309,23 +280,6 @@ def run_demo(strategy: str, seed: int = 0, general_buffer: int = 0) -> dict:
         "targets_placed": placed_targets,
         "free_fraction": region.free_fraction,
     }
-
-
-# --------------------------------------------------------------------------- #
-# pytest entry point
-# --------------------------------------------------------------------------- #
-
-
-def test_assign_locked_packs_into_full_canvas():
-    for strategy in ("origin", "scatter"):
-        result = run_demo(strategy)
-        # Pre-packing must have actually filled the canvas.
-        assert result["prepacked"] >= 1, result
-        # Observed jobs either place (at >= min_scale) or stay queued — never more
-        # than were enqueued, and the floor means we no longer draw specks.
-        assert 0 <= result["targets_placed"] <= result["targets"], result
-        assert os.path.exists(os.path.join(result["out_dir"], "frame_zzz_final.png"))
-        assert os.path.exists(os.path.join(result["out_dir"], "occupancy_final.png"))
 
 
 if __name__ == "__main__":

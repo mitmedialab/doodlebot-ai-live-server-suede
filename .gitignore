@@ -6,3 +6,5 @@ combined
 sketches
 static
 tests/output
+tests/*.log
+**/.env
