@@ -90,7 +90,6 @@ def _make_canvas(strategy: str, active_buffer: int) -> CanvasConfig:
         ],
         placement=PlacementSettings(strategy=strategy, targetFootprintMm=TARGET_MM),
         general_buffer=0,
-        active_buffer=active_buffer,
     )
 
 

@@ -194,7 +194,6 @@ class CanvasConfig(BaseModel):
     width: float
     height: float
     general_buffer: float = 0.0  # mm of clearance between separate drawings
-    active_buffer: int = 0  # unused by placement; see Canvas.active_buffer
     markers: list[ArucoMarker] = []
     regions: list[RegionConfig] = []
     placement: PlacementSettings = PlacementSettings()
@@ -218,8 +217,7 @@ DEFAULT_CANVASES: list[CanvasConfig] = [
             RegionConfig(id="left", x=0.0, y=0.0, width=500.0, height=1000.0),
             RegionConfig(id="right", x=500.0, y=0.0, width=500.0, height=1000.0),
         ],
-        general_buffer=0,
-        active_buffer=50,
+        general_buffer=30,
     )
 ]
 
@@ -266,7 +264,6 @@ def _build_canvas(cfg: CanvasConfig) -> Canvas:
             for r in cfg.regions
         ],
         general_buffer=cfg.general_buffer,
-        active_buffer=cfg.active_buffer,
     )
 
 

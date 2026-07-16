@@ -128,7 +128,6 @@ def _occupancy(region: Region, buffer: int) -> np.ndarray:
         width=REGION_W,
         height=REGION_H,
         general_buffer=buffer,
-        active_buffer=0,
         regions=[region],
     )
     return region.compute_occupancy(
@@ -138,9 +137,7 @@ def _occupancy(region: Region, buffer: int) -> np.ndarray:
 
 def _half_width_cells(config: PlacementConfig) -> int:
     """The ink half-thickness ``try_place`` rasterizes at: pen radius + clearance."""
-    return int(
-        math.ceil((config.pen_mm / 2.0 + config.clearance_mm) / config.cell_mm)
-    )
+    return int(math.ceil((config.pen_mm / 2.0 + config.clearance_mm) / config.cell_mm))
 
 
 def _stamp(region: Region, strokes: list[Stroke], at_mm: tuple[float, float]) -> None:
@@ -151,7 +148,9 @@ def _stamp(region: Region, strokes: list[Stroke], at_mm: tuple[float, float]) ->
     drawing stamps it — we're only choosing the pose ourselves instead of letting
     the search pick it.
     """
-    footprint = rasterize(strokes, region.config.cell_mm, _half_width_cells(region.config))
+    footprint = rasterize(
+        strokes, region.config.cell_mm, _half_width_cells(region.config)
+    )
     # ``_top``/``_left`` are the grid cell the mask's own (0,0) lands on; the mask
     # carries ``pad`` cells of margin before the strokes' min corner.
     left = int(round(at_mm[0] / region.config.cell_mm)) - footprint.pad
@@ -254,9 +253,9 @@ def test_renders_occupancy_for_source_drawings():
     assert result["ink_cells"] > 0, "no ink was committed — nothing to buffer"
 
     by_buffer = {f["buffer"]: f for f in result["frames"]}
-    assert by_buffer[0]["occupied_cells"] == result["ink_cells"], (
-        "a zero buffer must leave the grid alone"
-    )
+    assert (
+        by_buffer[0]["occupied_cells"] == result["ink_cells"]
+    ), "a zero buffer must leave the grid alone"
 
     # Every frame exists, and each larger buffer keeps out strictly more space.
     counts = [by_buffer[b]["occupied_cells"] for b in BUFFERS]
@@ -294,9 +293,9 @@ def test_buffer_only_ever_grows_the_ink():
         occupancy = _occupancy(region, buffer)
         assert occupancy.shape == region.grid.shape
         assert np.all(occupancy[ink]), f"buffer {buffer} un-occupied committed ink"
-        assert np.all(occupancy[previous]), (
-            f"buffer {buffer} freed space a smaller buffer kept out"
-        )
+        assert np.all(
+            occupancy[previous]
+        ), f"buffer {buffer} freed space a smaller buffer kept out"
         previous = occupancy
 
     # The grid itself is untouched — compute_occupancy snapshots, it doesn't mutate.

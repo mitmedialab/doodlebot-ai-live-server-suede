@@ -132,7 +132,6 @@ def _make_canvas(
             strategy=strategy, targetFootprintMm=TARGET_MM, cellMm=10.0
         ),
         general_buffer=general_buffer,
-        active_buffer=0,
     )
 
 

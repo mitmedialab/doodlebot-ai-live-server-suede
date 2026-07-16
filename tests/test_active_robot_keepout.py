@@ -214,7 +214,9 @@ def _place(region: Region, canvas: Canvas, drawings: list[list[Stroke]]) -> None
             general_buffer=GENERAL_BUFFER, canvas=canvas, active_drawings={}
         )
         placement = region.try_place(_fit(strokes, COMMIT_MM), context)
-        assert placement is not None, f"a {COMMIT_MM:g}mm drawing would not fit {region.id}"
+        assert (
+            placement is not None
+        ), f"a {COMMIT_MM:g}mm drawing would not fit {region.id}"
         region.commit(placement)
 
 
@@ -240,7 +242,6 @@ def _studio(with_ink: bool = True) -> Canvas:
         width=1000.0,
         height=1000.0,
         general_buffer=GENERAL_BUFFER,
-        active_buffer=0,
         regions=regions,
     )
     # Real drawings, committed the way the coordinator commits them: through the
@@ -258,15 +259,30 @@ def _annex(with_ink: bool = True) -> Canvas:
     the canvas gate is the only thing telling them apart.
     """
     regions = [
-        Region(id="west", x=0.0, y=0.0, width=500.0, height=500.0, robot="botE", config=_cfg()),
-        Region(id="east", x=500.0, y=0.0, width=500.0, height=500.0, robot="botF", config=_cfg()),
+        Region(
+            id="west",
+            x=0.0,
+            y=0.0,
+            width=500.0,
+            height=500.0,
+            robot="botE",
+            config=_cfg(),
+        ),
+        Region(
+            id="east",
+            x=500.0,
+            y=0.0,
+            width=500.0,
+            height=500.0,
+            robot="botF",
+            config=_cfg(),
+        ),
     ]
     canvas = Canvas(
         id="annex",
         width=1000.0,
         height=500.0,
         general_buffer=GENERAL_BUFFER,
-        active_buffer=0,
         regions=regions,
     )
     if with_ink:
@@ -606,14 +622,14 @@ def test_keepout_is_the_swept_body_and_never_under_covers():
         truth = _brute_sweep(tl, strokes, ROBOT_BODY)
 
         missed = truth & ~full
-        assert not missed.any(), (
-            f"{int(missed.sum())} cells the chassis actually covers were left free"
-        )
+        assert (
+            not missed.any()
+        ), f"{int(missed.sum())} cells the chassis actually covers were left free"
         # ...and the over-cover is only the one-cell margin, not slop.
         extra = int((full & ~truth).sum())
-        assert extra <= int(truth.sum()) * 0.15 + 200, (
-            f"keep-out over-covers by {extra} cells — more than the margin explains"
-        )
+        assert (
+            extra <= int(truth.sum()) * 0.15 + 200
+        ), f"keep-out over-covers by {extra} cells — more than the margin explains"
 
 
 def test_heading_changes_the_keepout():
@@ -656,8 +672,10 @@ def _swept(region: Region, strokes: list[Stroke], body: RobotBody) -> np.ndarray
             if poly:
                 d.polygon(
                     [
-                        ((p[0] - region.x) / region.config.cell_mm,
-                         (p[1] - region.y) / region.config.cell_mm)
+                        (
+                            (p[0] - region.x) / region.config.cell_mm,
+                            (p[1] - region.y) / region.config.cell_mm,
+                        )
                         for p in poly
                     ],
                     fill=1,
@@ -676,7 +694,10 @@ def _ink(region: Region, strokes: list[Stroke]) -> np.ndarray:
     w = int(round(2 * (cfg.pen_mm / 2 + cfg.clearance_mm) / cfg.cell_mm)) + 1
     for s in strokes:
         d.line(
-            [((p[0] - region.x) / cfg.cell_mm, (p[1] - region.y) / cfg.cell_mm) for p in s],
+            [
+                ((p[0] - region.x) / cfg.cell_mm, (p[1] - region.y) / cfg.cell_mm)
+                for p in s
+            ],
             fill=1,
             width=w,
         )
@@ -764,9 +785,9 @@ def test_body_collides_is_free_when_nobody_is_drawing():
             general_buffer=GENERAL_BUFFER, canvas=studio, active_drawings=active
         )
         assert not ctx.has_live_neighbour, f"{active!r} should not count as live"
-        assert not tl.body_collides(placement, ours_local, ctx), (
-            f"claimed a collision with {active!r}"
-        )
+        assert not tl.body_collides(
+            placement, ours_local, ctx
+        ), f"claimed a collision with {active!r}"
 
 
 def test_placed_strokes_land_on_the_anchor():
@@ -834,6 +855,7 @@ def test_try_place_is_unaffected_when_nobody_is_drawing():
     reach us must produce byte-identical placements, so the collision machinery
     costs nothing (and changes nothing) in the common case.
     """
+
     def run(active):
         studio = _studio(with_ink=False)
         tl = _subject(studio)
@@ -853,7 +875,9 @@ def test_try_place_is_unaffected_when_nobody_is_drawing():
     idle = run({})
     assert idle, "nothing placed"
     for active in ({"botB": None}, {"botD": CORNER_ONLY}, {"botB": OUT_OF_REACH}):
-        assert run(active) == idle, f"{active!r} perturbed placement despite being out of reach"
+        assert (
+            run(active) == idle
+        ), f"{active!r} perturbed placement despite being out of reach"
 
 
 def test_compute_occupancy_does_not_mutate_the_grid():
@@ -878,7 +902,9 @@ def test_active_keepout_composes_with_the_buffer():
 
     static, from_active = _layers(studio, {"botB": NEAR_EDGE})
     full = tl.compute_occupancy(
-        general_buffer=GENERAL_BUFFER, canvas=studio, active_drawings={"botB": NEAR_EDGE}
+        general_buffer=GENERAL_BUFFER,
+        canvas=studio,
+        active_drawings={"botB": NEAR_EDGE},
     )
 
     assert full.shape == tl.grid.shape
