@@ -501,6 +501,24 @@ def compute_exit_pose(
 class _Coordinator:
     """Thread-safe matchmaker between approved drawings and the ready bot pool."""
 
+    #: Wall-clock ceiling for one ``_assign_locked`` pass, in seconds.
+    #:
+    #: That pass runs inside the check-in lock, so it delays *every* robot's poll.
+    #: Placement is unbounded by nature — a tight canvas means more rotations
+    #: searched, more shrink-to-fit steps, more candidate bots — so it is capped
+    #: rather than trusted. Whatever it doesn't get to stays queued for the next
+    #: check-in, roughly a second later; nothing is dropped.
+    assign_budget_s: float = 5.0
+
+    #: Wall-clock ceiling for one *job* within a pass, in seconds.
+    #:
+    #: Bounds the damage a single awkward drawing can do. Without it, a drawing
+    #: that is expensive to fail at (fits nowhere, so every bot runs a full
+    #: bisection) would eat the whole pass, every pass, and the jobs behind it
+    #: would never be looked at. Exceed this without placing and the job goes to
+    #: the back of the queue.
+    job_budget_s: float = 1.0
+
     def __init__(
         self, canvases: list[CanvasConfig], seed: Optional[int] = None
     ) -> None:
@@ -712,34 +730,70 @@ class _Coordinator:
         resolved start pose for delivery on that bot's next check-in. Jobs that
         currently fit nowhere stay queued (a region only fills up, so they wait
         for a different ready bot — re-tried on every check-in).
+
+        This runs inside the check-in lock, so it is on the critical path of every
+        robot's poll, and a placement search is not cheap — hundreds of ms on a
+        tight canvas, times the shrink-to-fit bisection, times each candidate bot.
+        Two budgets keep that bounded (see ``assign_budget_s``/``job_budget_s``):
+        the pass stops starting new work once it's out of time, and a job that eats
+        its own budget without placing goes to the *back* of the queue so it can't
+        starve everything behind it. Both are checked between units of work, so the
+        real ceiling is the budget plus whatever search was already running.
         """
 
         if not self._queue:
             return
 
+        started = time.monotonic()
+        deadline = started + self.assign_budget_s
+
         # One prepared snapshot per region, reused for every job and every candidate
         # bot in this pass. Building it costs an occupancy dilation, an FFT and the
         # neighbours' body sweep, and none of that depends on the drawing being
-        # placed — so the only thing that may invalidate it is the region's ink or
-        # the set of live drawings changing, both of which happen only when we
-        # commit. See ``_invalidate`` below.
-        contexts: dict[str, canvas_engine.PlacementContext] = {}
+        # placed. Keyed by canvas as well as region: region ids are only unique
+        # within their own canvas.
+        contexts: dict[tuple[str, str], canvas_engine.PlacementContext] = {}
 
-        def context_for(region: Region, canvas) -> canvas_engine.PlacementContext:
-            context = contexts.get(region.id)
+        def context_for(region: Region, canvas: Canvas) -> canvas_engine.PlacementContext:
+            key = (canvas.id, region.id)
+            context = contexts.get(key)
             if context is None:
                 context = region.prepare(
                     general_buffer=canvas.general_buffer,
                     canvas=canvas,
                     active_drawings=self.drawingDictionary,
                 )
-                contexts[region.id] = context
+                contexts[key] = context
             return context
 
+        def invalidate(region: Region, canvas: Canvas) -> None:
+            """Drop the snapshots that committing into ``region`` just invalidated.
+
+            Exactly two kinds go stale, and nothing else:
+
+            1. ``region`` itself — it has new ink, so its occupancy moved.
+            2. Regions on this canvas that ``adjoins`` it — their occupancy folds in
+               the live bodies of robots next door, and the bot we just staged has
+               become one.
+
+            Everything else is untouched: a region that doesn't adjoin this one
+            can't see the new robot (``_active_robot_keepout`` gates on exactly that
+            predicate), and other canvases can't see it at all.
+            """
+            contexts.pop((canvas.id, region.id), None)
+            for other in canvas.regions:
+                if other.id != region.id and other.adjoins(region):
+                    contexts.pop((canvas.id, other.id), None)
+
         still_queued: deque[_QueuedJob] = deque()
+        deferred: deque[_QueuedJob] = deque()  # blew their budget — go to the back
         while self._queue:
+            if time.monotonic() >= deadline:
+                break  # out of time; whatever's left in _queue is simply untried
+
             qj = self._queue.popleft()
             placed = False
+            job_deadline = min(deadline, time.monotonic() + self.job_budget_s)
 
             candidates = [
                 r
@@ -751,6 +805,8 @@ class _Coordinator:
             candidates.sort(key=self._score, reverse=True)
 
             for bot in candidates:
+                if time.monotonic() >= job_deadline:
+                    break  # this job has had its turn; the rest of the queue waits
                 region = self._store.region_for_robot(bot.name)
                 canvas = self._store.canvas_for_robot(bot.name)
                 assert region is not None
@@ -761,7 +817,7 @@ class _Coordinator:
                 # rotates the ink for a tighter fit; that rotation rides on the
                 # approach heading, so the drawing commands are sent unchanged.
                 placement, scaled_commands = self._place_scaled(
-                    region, qj, context_for(region, canvas)
+                    region, qj, context_for(region, canvas), deadline=job_deadline
                 )
                 if placement is None:
                     continue  # won't fit even at min scale — try another bot
@@ -797,19 +853,27 @@ class _Coordinator:
                 )
                 self.drawingDictionary[bot.name] = drawing_strokes
 
-                # This bot is now a live obstacle for every region that shares an
-                # edge with its own, and its region has new ink — so every cached
-                # snapshot is potentially stale. Dropping all of them is the honest
-                # move: a snapshot that outlives what it describes places a drawing
-                # on top of one we just committed.
-                contexts.clear()
-
+                invalidate(region, canvas)
                 placed = True
                 break
 
-            if not placed:
+            if placed:
+                continue
+            if candidates and time.monotonic() >= job_deadline:
+                # Had somewhere to try, spent its whole budget, still homeless. Send
+                # it to the back so the jobs behind it get a turn — otherwise a
+                # drawing that is merely expensive to *fail* at would monopolise
+                # every pass forever. The ``candidates`` test matters: a job with no
+                # ready bot didn't burn anything, it just had nowhere to go, and
+                # demoting it for that would shuffle the queue on every idle poll.
+                deferred.append(qj)
+            else:
                 still_queued.append(qj)
 
+        # Order out: tried-and-didn't-fit first (unchanged relative order), then
+        # anything we never got to, then the jobs that timed out.
+        still_queued.extend(self._queue)
+        still_queued.extend(deferred)
         self._queue = still_queued
 
     def _score(self, record: _RobotRecord) -> tuple[float, float]:
@@ -849,6 +913,7 @@ class _Coordinator:
         context: canvas_engine.PlacementContext,
         scale_tol: float = 0.02,
         max_iters: int = 12,
+        deadline: Optional[float] = None,
     ) -> tuple[Optional[Placement], list]:
         """Place the drawing at this region's target footprint size, shrinking only
         if it won't fit. Returns ``(placement, scaled_commands)``.
@@ -873,6 +938,12 @@ class _Coordinator:
         each step costs a full placement search, and refining below a couple of
         percent moves the footprint less than an occupancy cell. ``max_iters`` is
         a hard backstop.
+
+        ``deadline`` (a ``time.monotonic`` stamp) stops the bisection early. The
+        full-size attempt always runs — it's the common case and the reason we're
+        here — but the refinement is the expensive part and the most expendable:
+        giving up returns the best fit found so far, which is a real placement, just
+        possibly smaller than one more step would have found.
         """
 
         if qj.native_span <= 0:
@@ -905,6 +976,8 @@ class _Coordinator:
         best_commands: list = qj.drawing
         iters = 0
         while hi - lo > scale_tol and iters < max_iters:
+            if deadline is not None and time.monotonic() >= deadline:
+                break  # out of time — keep the best fit we've already proved
             iters += 1
             mid = (lo + hi) / 2.0
             placement, commands = attempt(mid)
