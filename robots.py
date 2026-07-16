@@ -193,7 +193,7 @@ class CanvasConfig(BaseModel):
     id: str
     width: float
     height: float
-    general_buffer: float = 0.0  # mm of clearance between separate drawings
+    general_buffer: float = 30.0  # mm of clearance between separate drawings
     markers: list[ArucoMarker] = []
     regions: list[RegionConfig] = []
     placement: PlacementSettings = PlacementSettings()
