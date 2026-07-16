@@ -54,6 +54,21 @@ from PIL import Image, ImageDraw
 from scipy.fft import next_fast_len
 import cv2
 
+
+@dataclass
+class PlacedDrawing:
+    job_id: str
+    robot_name: str
+    anchor_x: float
+    anchor_y: float
+    angle_deg: float
+    commands: list
+    strokes: list
+    exit_pose_x: float
+    exit_pose_y: float
+    exit_pose_deg: float
+
+
 # --------------------------------------------------------------------------- #
 # Command protocol (duck-typed against robots.py's pydantic models)
 # --------------------------------------------------------------------------- #
@@ -721,6 +736,43 @@ class Region:
     @property
     def free_fraction(self) -> float:
         return 1.0 - float(self.grid.sum()) / float(self.grid.size)
+
+    def add_drawings(self, drawings: list[PlacedDrawing]) -> None:
+        """Rebuild the occupancy grid from already-placed drawings."""
+
+        cell = self.config.cell_mm
+        half = int(
+            math.ceil((self.config.pen_mm / 2.0 + self.config.clearance_mm) / cell)
+        )
+
+        for drawing in drawings:
+            footprint = rasterize(drawing.strokes, cell, half)
+            if footprint is None:
+                continue
+
+            top = int(round((footprint.min_y - self.y) / cell))
+            left = int(round((footprint.min_x - self.x) / cell))
+
+            mask = footprint.mask
+            mh, mw = mask.shape
+
+            # Clip in case the saved drawing lies partially outside the region.
+            grid_top = max(0, top)
+            grid_left = max(0, left)
+            grid_bottom = min(self.grid.shape[0], top + mh)
+            grid_right = min(self.grid.shape[1], left + mw)
+
+            if grid_bottom <= grid_top or grid_right <= grid_left:
+                continue
+
+            mask_top = grid_top - top
+            mask_left = grid_left - left
+            mask_bottom = mask_top + (grid_bottom - grid_top)
+            mask_right = mask_left + (grid_right - grid_left)
+
+            self.grid[grid_top:grid_bottom, grid_left:grid_right] |= mask[
+                mask_top:mask_bottom, mask_left:mask_right
+            ].astype(np.uint8)
 
     @property
     def _rect(self) -> tuple[float, float, float, float]:
