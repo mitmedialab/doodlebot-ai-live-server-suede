@@ -591,26 +591,14 @@ class _Coordinator:
         if canvas_id not in self._drawings:
             self._drawings[canvas_id] = []
         for drawing in drawings:
-            placedDrawing = PlacedDrawing(
-                job_id=drawing.job_id,
-                anchor_x=drawing.anchor_x,
-                anchor_y=drawing.anchor_y,
-                angle_deg=drawing.angle_deg,
-                strokes=drawing.strokes,
-                commands=drawing.commands,
-                robot_name=drawing.robot_name,
-                exit_pose_x=drawing.exit_pose_x,
-                exit_pose_y=drawing.exit_pose_y,
-                exit_pose_deg=drawing.exit_pose_deg,
-            )
-            self._drawings[canvas_id].append(placedDrawing)
+            self._drawings[canvas_id].append(drawing)
             canvas = self._store.get(canvas_id)
             if canvas is None:
                 return
             region = canvas.region_for_robot(drawing.robot_name)
             if region is None:
                 return
-            region.add_drawings([placedDrawing])
+            region.add_drawings([drawing])
 
     def remove_canvas(self, canvas_id: str) -> None:
         with self._lock:
@@ -1268,21 +1256,7 @@ async def get_canvases(request: Request) -> Canvases:
                     )
                     for r in c.regions
                 ],
-                drawings=[
-                    PlacedDrawing(
-                        job_id=s.job_id,
-                        anchor_x=s.anchor_x,
-                        anchor_y=s.anchor_y,
-                        angle_deg=s.angle_deg,
-                        strokes=s.strokes,
-                        commands=s.commands,
-                        robot_name=s.robot_name,
-                        exit_pose_x=s.exit_pose_x,
-                        exit_pose_y=s.exit_pose_y,
-                        exit_pose_deg=s.exit_pose_deg,
-                    )
-                    for s in drawings
-                ],
+                drawings=[drawing for drawing in drawings],
                 freeFractionByRegion={r.id: r.free_fraction for r in c.regions},
             )
         )
