@@ -151,6 +151,7 @@ class RegionConfig(BaseModel):
     width: float
     height: float
     robot: Optional[str] = None  # the robot name assigned to draw this region
+    color: Optional[str] = "#000"
 
 
 class PlacementSettings(BaseModel):
@@ -236,6 +237,7 @@ def _build_canvas(cfg: CanvasConfig) -> Canvas:
                 width=r.width,
                 height=r.height,
                 robot=r.robot,
+                color=r.color,
                 config=placement,
             )
             for r in cfg.regions
@@ -761,6 +763,11 @@ class _Coordinator:
                         return placed.robot_name
             return None
 
+    def color_for_robot(self, robot_name: str) -> str:
+        region = self._store.region_for_robot(robot_name)
+        color = region.color if region is not None else "#FF0000"
+        return color if color is not None else "#FF0000"
+
     # -- internals ---------------------------------------------------------- #
 
     def scale_commands(self, commands, scale):
@@ -1253,6 +1260,7 @@ async def get_canvases(request: Request) -> Canvases:
                         width=r.width,
                         height=r.height,
                         robot=r.robot,
+                        color=r.color,
                     )
                     for r in c.regions
                 ],
