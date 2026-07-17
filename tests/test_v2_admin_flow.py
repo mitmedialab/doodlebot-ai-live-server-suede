@@ -322,10 +322,12 @@ def test_sketch_gated_until_admin_and_rejection(client: TestClient) -> None:
     client_id = _new_client(client)
     sketch_id = _submit(client, client_id, seed=1)
 
-    # Nothing has flowed to the client but the creation event — no status yet.
+    # Nothing has flowed to the client but the creation event — no status yet —
+    # and it carries the session the sketch was submitted under.
     sketch = v2.manager.sketches[sketch_id]
     assert sketch.state == "approval-pending"
-    assert _events(sketch_id) == [{"sketch": sketch_id}]
+    assert sketch.session == SESSION
+    assert _events(sketch_id) == [{"sketch": sketch_id, "session": SESSION}]
     assert not _has_field(sketch_id, "status")
     assert sketch_id in v2.manager.pending_sketches
 
@@ -358,7 +360,11 @@ def test_sketch_gated_until_admin_and_rejection(client: TestClient) -> None:
     )
     assert resp.status_code == 200, resp.text
     assert sketch_id not in v2.manager.pending_sketches
-    assert _events(sketch_id)[-1] == {"sketch": sketch_id, "status": "innapropriate"}
+    assert _events(sketch_id)[-1] == {
+        "sketch": sketch_id,
+        "session": SESSION,
+        "status": "innapropriate",
+    }
     assert v2.manager.sketches[sketch_id].state == "approval-pending"  # never grouped
 
     # A second admin resolving the already-resolved sketch (even with a different
@@ -433,6 +439,8 @@ def test_two_options_offered_then_chosen_to_robot(client: TestClient) -> None:
         robot_event = next(e for e in events if "robot" in e)
         assert robot_event["robot"] == "bot-choose"
         assert robot_event.get("color") == "#112233"
+        # The session sticks with the sketch across every event of its lifecycle.
+        assert all(e.get("session") == SESSION for e in events)
 
     # The served SVG (registered under the stable locator id) is a render of the
     # chosen option.
