@@ -54,7 +54,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator, Literal, Coroutine, Any, Sequence
+from typing import AsyncIterator, Literal, Coroutine, Any, Sequence, cast
 
 import numpy as np
 import openai
@@ -193,9 +193,37 @@ class SketchResponse(BaseModel):
 
 class Admin:
     class Sketch:
+        class SubmitterStats(BaseModel):
+            """A snapshot — baked in at the moment the payload is sent, not live —
+            of the submitting client's sketch history across the whole system.
+
+            Lets the admin prioritize the queue. The intent is to surface users who
+            haven't yet had an honest attempt approved: prefer low ``approved`` and
+            low ``pending`` (likely a first-timer waiting on their debut), and treat
+            a lone ``rejected_complex`` with little else as worth a quick re-look (a
+            user stuck on a too-detailed drawing), while a pile of
+            ``rejected_innapropriate`` flags someone likely pushing content through.
+
+            The four buckets partition the client's sketches, so
+            ``submitted == pending + approved + rejected_complex +
+            rejected_innapropriate``."""
+
+            submitted: int
+            """Total sketches this client has ever submitted."""
+            pending: int
+            """Awaiting an admin verdict (includes the sketch this payload is about)."""
+            approved: int
+            """Given the "approved" verdict (whether or not they've drawn yet)."""
+            rejected_complex: int
+            """Rejected with the "complex" verdict (too detailed to combine/vectorize)."""
+            rejected_innapropriate: int
+            """Rejected with the "innapropriate" verdict (unsafe content)."""
+
         class SSEPayload(BaseModel):
             type: Literal["sketch"]
             sketch_id: str
+            submitter: "Admin.Sketch.SubmitterStats"
+            """The submitting client's history, for queue prioritization."""
 
         class Request(BaseModel):
             """How the admin client responds"""
@@ -235,6 +263,11 @@ class Admin:
             """
 
 
+# Resolve the forward reference to the (nested) SubmitterStats now that Admin
+# exists — the annotation couldn't be a bare name across the nested class scope.
+Admin.Sketch.SSEPayload.model_rebuild()
+
+
 # --- Server-side domain model ---------------------------------------------
 
 # The pipeline states a sketch moves through. Mirrors the client's ScreenId.
@@ -269,6 +302,11 @@ class Sketch:
     client_id: str
     created: str
     state: ServerState = "approval-pending"
+    # The admin's moderation verdict, or None while still awaiting one. Distinct
+    # from `state` (which a rejected sketch leaves at "approval-pending"): this is
+    # what tells pending/approved/complex/innapropriate apart, so it drives the
+    # submitter stats surfaced to the admin. Persisted so counts survive a restart.
+    verdict: "SketchStatus | None" = None
     # The full ordered log of every payload emitted for this sketch, so a
     # reconnecting client can be replayed back to the sketch's current state.
     events: list[ClientSSEPayload] = field(default_factory=list)
@@ -279,6 +317,7 @@ class Sketch:
             "client_id": self.client_id,
             "created": self.created,
             "state": self.state,
+            "verdict": self.verdict,
             "events": [e.model_dump(exclude_none=True) for e in self.events],
         }
 
@@ -289,6 +328,7 @@ class Sketch:
             client_id=meta["client_id"],
             created=meta.get("created", ""),
             state=meta.get("state", "approval-pending"),
+            verdict=meta.get("verdict"),
             events=[ClientSSEPayload(**e) for e in meta.get("events", [])],
         )
 
@@ -381,6 +421,10 @@ class Manager:
         self.pending_sketches: dict[str, Sketch] = {}
         # Combined vectorizations awaiting a verdict, keyed by their locator id.
         self.pending_vectorizations: dict[str, _PendingVectorization] = {}
+        # Locator ids of vectorizations already resolved, so a duplicate/second-
+        # admin resolve is an idempotent no-op rather than a 404. Ids are short
+        # hex strings and trios are infrequent, so this set stays tiny.
+        self.resolved_vectorizations: set[str] = set()
         self._load_from_disk()
 
     # -- startup recovery ---------------------------------------------------
@@ -446,9 +490,7 @@ class Manager:
         queue: "asyncio.Queue[str]" = asyncio.Queue()
         self._admin_subscribers.add(queue)
         for sketch in self.pending_sketches.values():
-            queue.put_nowait(
-                _encode_admin(Admin.Sketch.SSEPayload(type="sketch", sketch_id=sketch.id))
-            )
+            queue.put_nowait(_encode_admin(self._sketch_payload(sketch)))
         for pending in self.pending_vectorizations.values():
             queue.put_nowait(_encode_admin(_vectorization_payload(pending)))
         return queue
@@ -586,8 +628,42 @@ class Manager:
         approval hand-off is in-flight pipeline state, which — consistent with the
         combine/robot stages — is not resumed. See the Manager durability note."""
         self.pending_sketches[sketch.id] = sketch
-        self._notify_admin(
-            Admin.Sketch.SSEPayload(type="sketch", sketch_id=sketch.id)
+        self._notify_admin(self._sketch_payload(sketch))
+
+    def _sketch_payload(self, sketch: Sketch) -> "Admin.Sketch.SSEPayload":
+        """Build the admin SSE payload for a pending sketch, with a fresh snapshot
+        of its submitter's stats. Shared by the live notify and the on-connect
+        backlog replay so both carry stats and never drift."""
+        return Admin.Sketch.SSEPayload(
+            type="sketch",
+            sketch_id=sketch.id,
+            submitter=self._submitter_stats(sketch.client_id),
+        )
+
+    def _submitter_stats(self, client_id: str) -> "Admin.Sketch.SubmitterStats":
+        """Count a client's sketches by verdict, right now. Cheap (a client has
+        few sketches) and computed at send time, so the numbers are a point-in-time
+        snapshot rather than a live-updating figure."""
+        client = self.clients.get(client_id)
+        sketch_ids = client.sketch_ids if client is not None else []
+        pending = approved = complex_ = innapropriate = 0
+        for sketch_id in sketch_ids:
+            sketch = self.sketches.get(sketch_id)
+            verdict = sketch.verdict if sketch is not None else None
+            if verdict is None:
+                pending += 1
+            elif verdict == "approved":
+                approved += 1
+            elif verdict == "complex":
+                complex_ += 1
+            elif verdict == "innapropriate":
+                innapropriate += 1
+        return Admin.Sketch.SubmitterStats(
+            submitted=len(sketch_ids),
+            pending=pending,
+            approved=approved,
+            rejected_complex=complex_,
+            rejected_innapropriate=innapropriate,
         )
 
     def resolve_sketch(self, sketch_id: str, status: SketchStatus) -> None:
@@ -602,9 +678,14 @@ class Manager:
         if sketch is None:
             raise HTTPException(status_code=404, detail="unknown sketch")
         if self.pending_sketches.pop(sketch_id, None) is None:
-            raise HTTPException(
-                status_code=409, detail="sketch is not awaiting approval"
-            )
+            # Already resolved — by another admin, or a duplicate of this request.
+            # First write wins: this is an idempotent no-op, not an error, and it
+            # leaves the existing verdict/state untouched. (No await runs before
+            # the pop above, so concurrent resolves can't both pass it.)
+            return
+
+        # Record the verdict (drives the submitter stats) before anything else.
+        sketch.verdict = status
 
         if status != "approved":
             # Terminal. Keep it in "approval-pending" (out of the pool); the client
@@ -680,12 +761,21 @@ class Manager:
         store + robot dispatch, which can block for a robot assignment) runs as a
         background task so the admin's HTTP call returns immediately.
 
-        Every response is a drawable vectorization — there is no reject path."""
+        Every response is a drawable vectorization — there is no reject path.
+
+        Idempotent under concurrent admins: the first resolve wins and the rest are
+        no-ops. No await runs before the pop, so two concurrent resolves can't both
+        take the pending entry; a later one finds it already resolved and returns
+        without re-finalizing (so the drawing isn't dispatched twice)."""
         pending = self.pending_vectorizations.pop(req.vectorization_id, None)
         if pending is None:
+            if req.vectorization_id in self.resolved_vectorizations:
+                # Already resolved — first write wins, this is a no-op.
+                return
             raise HTTPException(
-                status_code=404, detail="unknown or already-resolved vectorization"
+                status_code=404, detail="unknown vectorization"
             )
+        self.resolved_vectorizations.add(req.vectorization_id)
         self._spawn(self._finalize_vectorization(pending, req.commands))
 
     async def _finalize_vectorization(
@@ -791,9 +881,7 @@ class Manager:
                 # 2) Vectorize the combined drawing into the low-geometry robot
                 #    strokes. These are what the admin reviews and what ultimately
                 #    drives the robot.
-                commands = await asyncio.to_thread(
-                    _vectorize_for_robot, combined_png
-                )
+                commands = await asyncio.to_thread(_vectorize_for_robot, combined_png)
                 return commands
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
@@ -960,7 +1048,9 @@ def _render_commands_svg(commands: list[DrawingCommand]) -> str:
     standalone SVG — pen-up travel moves hidden so the served image is just the
     black contour. The typed models are dumped back to the dict form
     commands_to_svg consumes."""
-    return _commands_to_svg([command.model_dump() for command in commands])
+    return _commands_to_svg(
+        [cast(VectorDrawingCommand, command.model_dump()) for command in commands]
+    )
 
 
 # --- misc helpers ----------------------------------------------------------

@@ -194,8 +194,13 @@ def _sketch_data_url(seed: int) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def _wait_until(predicate, timeout: float = 6.0, interval: float = 0.05):
-    """Poll ``predicate`` (which the loop-thread background tasks make true)."""
+def _wait_until(predicate, timeout: float = 20.0, interval: float = 0.05):
+    """Poll ``predicate`` (which the loop-thread background tasks make true).
+
+    Generous default: the combine path runs the real (CPU-bound) vectorizer, and
+    its first invocation in a fresh process pays a cold-start cost — a successful
+    wait still returns the instant the predicate holds, so only genuine failures
+    pay the full timeout."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         value = predicate()
@@ -269,13 +274,17 @@ def _submit(client: TestClient, client_id: str, seed: int) -> str:
     return resp.json()["sketch"]
 
 
-def _approve_sketch(client: TestClient, sketch_id: str) -> None:
+def _resolve_sketch(client: TestClient, sketch_id: str, status: str) -> None:
     resp = client.post(
         "/admin/sketch",
         params={"token": TOKEN},
-        json={"sketch_id": sketch_id, "status": "approved"},
+        json={"sketch_id": sketch_id, "status": status},
     )
     assert resp.status_code == 200, resp.text
+
+
+def _approve_sketch(client: TestClient, sketch_id: str) -> None:
+    _resolve_sketch(client, sketch_id, "approved")
 
 
 def _make_trio(client: TestClient, seeds: list[int]) -> list[str]:
@@ -308,9 +317,19 @@ def test_sketch_gated_until_admin_and_rejection(client: TestClient) -> None:
     assert not _has_field(sketch_id, "status")
     assert sketch_id in v2.manager.pending_sketches
 
-    # A connecting admin is told this sketch is waiting.
+    # A connecting admin is told this sketch is waiting, with the submitter's
+    # stats — a first-time submitter: one pending (this sketch), nothing else.
     backlog = _drain_admin_backlog()
-    assert {"type": "sketch", "sketch_id": sketch_id} in backlog
+    event = next(
+        e for e in backlog if e.get("type") == "sketch" and e["sketch_id"] == sketch_id
+    )
+    assert event["submitter"] == {
+        "submitted": 1,
+        "pending": 1,
+        "approved": 0,
+        "rejected_complex": 0,
+        "rejected_innapropriate": 0,
+    }
 
     # Both admin endpoints are gated.
     assert client.get("/admin/events").status_code == 401
@@ -329,13 +348,27 @@ def test_sketch_gated_until_admin_and_rejection(client: TestClient) -> None:
     assert sketch_id not in v2.manager.pending_sketches
     assert _events(sketch_id)[-1] == {"sketch": sketch_id, "status": "innapropriate"}
     assert v2.manager.sketches[sketch_id].state == "approval-pending"  # never grouped
-    # Rejecting a resolved sketch again is a conflict.
+
+    # A second admin resolving the already-resolved sketch (even with a different
+    # verdict) is an idempotent no-op: 200, and the first verdict/state stands.
+    events_before = _events(sketch_id)
     again = client.post(
         "/admin/sketch",
         params={"token": TOKEN},
         json={"sketch_id": sketch_id, "status": "approved"},
     )
-    assert again.status_code == 409
+    assert again.status_code == 200, again.text
+    assert v2.manager.sketches[sketch_id].verdict == "innapropriate"  # first write wins
+    assert v2.manager.sketches[sketch_id].state == "approval-pending"
+    assert _events(sketch_id) == events_before  # no new status emitted
+
+    # A genuinely unknown sketch id still 404s (catches typos/bugs).
+    unknown = client.post(
+        "/admin/sketch",
+        params={"token": TOKEN},
+        json={"sketch_id": "deadbeef" * 8, "status": "approved"},
+    )
+    assert unknown.status_code == 404
 
 
 def test_two_options_offered_then_chosen_to_robot(client: TestClient) -> None:
@@ -435,13 +468,25 @@ def test_admin_trims_chosen_option(client: TestClient) -> None:
     for option in pending.command_options:
         assert stored.decode("utf-8") != v2._render_commands_svg(option)
 
-    # A resolved vectorization can't be resolved again.
+    # A second admin resolving the same vectorization — even with different
+    # commands — is an idempotent no-op: 200, and the first choice's SVG stands.
+    other_commands = [{"kind": "arc", "radius": 50.0, "degrees": 180.0}]
     again = client.post(
         "/admin/vectorization",
         params={"token": TOKEN},
-        json={"vectorization_id": pending.id, "commands": trimmed},
+        json={"vectorization_id": pending.id, "commands": other_commands},
     )
-    assert again.status_code == 404
+    assert again.status_code == 200, again.text
+    still = _FAKE_STORAGE.blobs[FakeStorage.resource_key(pending.id, "image/svg+xml")]
+    assert still == stored, "second resolve must not overwrite the first choice"
+
+    # A genuinely unknown vectorization id still 404s.
+    unknown = client.post(
+        "/admin/vectorization",
+        params={"token": TOKEN},
+        json={"vectorization_id": "deadbeef" * 8, "commands": other_commands},
+    )
+    assert unknown.status_code == 404
 
 
 def test_combine_concurrency_is_bounded(client: TestClient) -> None:
@@ -503,6 +548,51 @@ def test_combine_retries_on_rate_limit(client: TestClient) -> None:
         v2.COMBINE_BACKOFF_BASE, v2.COMBINE_BACKOFF_MAX = 1.0, 30.0
 
 
+def test_sketch_payload_carries_submitter_stats(client: TestClient) -> None:
+    # One client with a mixed history: 1 approved, 1 complex-reject, 1
+    # innapropriate-reject, then 2 still pending.
+    heavy = _new_client(client)
+    approved = _submit(client, heavy, seed=71)
+    _resolve_sketch(client, approved, "approved")
+    too_complex = _submit(client, heavy, seed=72)
+    _resolve_sketch(client, too_complex, "complex")
+    unsafe = _submit(client, heavy, seed=73)
+    _resolve_sketch(client, unsafe, "innapropriate")
+    pending_d = _submit(client, heavy, seed=74)
+    pending_e = _submit(client, heavy, seed=75)
+
+    # A different, first-time client with a single pending sketch.
+    newcomer = _new_client(client)
+    first = _submit(client, newcomer, seed=76)
+
+    events = {
+        e["sketch_id"]: e
+        for e in _drain_admin_backlog()
+        if e.get("type") == "sketch"
+    }
+
+    # Both of the heavy client's pending sketches carry the same full snapshot,
+    # baked in at send time: 5 submitted, 2 pending, and one of each resolved kind.
+    expected_heavy = {
+        "submitted": 5,
+        "pending": 2,
+        "approved": 1,
+        "rejected_complex": 1,
+        "rejected_innapropriate": 1,
+    }
+    assert events[pending_d]["submitter"] == expected_heavy
+    assert events[pending_e]["submitter"] == expected_heavy
+
+    # The newcomer reads as an honest first attempt: prioritize this one.
+    assert events[first]["submitter"] == {
+        "submitted": 1,
+        "pending": 1,
+        "approved": 0,
+        "rejected_complex": 0,
+        "rejected_innapropriate": 0,
+    }
+
+
 # --- pytest fixture / standalone runner ------------------------------------
 
 try:
@@ -528,6 +618,7 @@ def _run_standalone() -> int:
         test_admin_trims_chosen_option,
         test_combine_concurrency_is_bounded,
         test_combine_retries_on_rate_limit,
+        test_sketch_payload_carries_submitter_stats,
     ]
     failures = 0
     with TestClient(app) as test_client:
