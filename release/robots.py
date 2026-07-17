@@ -298,6 +298,7 @@ class CheckIn:
         action: Literal["draw"] = "draw"
         jobId: str
         navigateTo: Pose
+        navigateFrom: Pose
         commands: list[DrawingCommand]
         exitPose: Optional[Pose] = None
 
@@ -675,6 +676,7 @@ class _Coordinator:
                 return CheckIn.Draw(
                     jobId=staged.job.jobId,
                     navigateTo=staged.navigate_to,
+                    navigateFrom=staged.navigate_from,
                     commands=staged.commands,
                     exitPose=exit_pose,
                 )
