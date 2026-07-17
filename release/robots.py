@@ -795,12 +795,17 @@ class _Coordinator:
 
                 region.commit(placement)
                 print(scaled_commands)
+                staged_angle = qj.heading0 + placement.angle_deg
 
                 _, navigateFrom = canvas_engine.commands_to_strokes_with_pose(
-                    scaled_commands
+                    scaled_commands,
+                    Pose(
+                        x=placement.anchor_x,
+                        y=placement.anchor_y,
+                        headingDegrees=staged_angle,
+                    ),
                 )
 
-                staged_angle = qj.heading0 + placement.angle_deg
                 bot.staged = _StagedJob(
                     job=qj.job,
                     navigate_to=Pose(

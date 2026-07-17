@@ -100,19 +100,21 @@ class Pose(BaseModel):
 def commands_to_strokes(
     commands: Sequence[Command], arc_step_deg: float = 6.0
 ) -> list[Stroke]:
-    strokes, _ = commands_to_strokes_with_pose(commands, arc_step_deg)
+    strokes, _ = commands_to_strokes_with_pose(
+        commands, Pose(x=0, y=0, headingDegrees=0), arc_step_deg
+    )
     return strokes
 
 
 def commands_to_strokes_with_pose(
-    commands: Sequence[Command], arc_step_deg: float = 6.0
+    commands: Sequence[Command], start: Pose, arc_step_deg: float = 6.0
 ) -> tuple[list[Stroke], Pose]:
     """Same turtle-integration as commands_to_strokes, but also returns the
     final local pose (x, y, headingDegrees). Uses the exact same math as the
     stroke generation (including chord-flattened arcs), so the returned pose
     is guaranteed consistent with the last point of the last stroke."""
 
-    x, y, heading = 0.0, 0.0, 0.0
+    x, y, heading = start.x, start.y, start.headingDegrees
     strokes: list[Stroke] = []
     current: Stroke = []
 
