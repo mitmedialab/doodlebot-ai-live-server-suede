@@ -7,20 +7,34 @@ server's fakery with the real pipeline:
 
   * sketch/vectorization image blobs are persisted to S3 (storage.py) and served
     via presigned-URL redirects; only per-sketch meta JSON stays on local disk;
+  * every submitted sketch is held for a **human admin** to approve before it can
+    group — this is the moderation gate that keeps inappropriate drawings out;
   * approved sketches are grouped into trios *incrementally* — a submitter is
     told about each companion the moment it appears, rather than waiting for the
     whole trio to complete;
   * a completed trio is combined into a single drawing by GPT Image 1 and that
-    result is vectorized into robot-drawable strokes; the rendered vectorization
-    is served back to every member of the trio.
+    result is vectorized into robot-drawable strokes; that vectorization is then
+    held for the **admin** to approve (and optionally simplify) before it is
+    served back to every member of the trio and dispatched to a robot.
 
-Routes (identical to the test server), exported on ``router`` and mounted by
-release/app.py alongside the existing v1 routes:
+Routes (the client-facing four match the test server), exported on ``router`` and
+mounted by release/app.py alongside the existing v1 routes:
 
   GET  /client                 -> { "client": "<uuid>" }
   POST /sketch                 -> { "sketch": "<sha256>" }   (body: client + data URL)
   GET  /resource/{resource_id} -> the sketch PNG or the vectorization SVG
   GET  /events?client=<id>     -> text/event-stream of SSEPayload objects
+
+Admin routes (gated by ``require_admin``; a separate admin front-end drives them):
+
+  GET  /admin/events           -> text/event-stream of items awaiting approval
+  POST /admin/sketch           -> record an admin's verdict on a sketch
+  POST /admin/vectorization    -> approve / simplify / reject a vectorization
+
+DESIGN NOTE (admin as resource locators): like ``ClientSSEPayload``'s ids, the
+``sketch_id`` and ``vectorization_id`` the admin stream hands out are opaque
+locators. The admin echoes one back on its response endpoint and the server
+resolves it to the exact pending entity — no session state on the admin side.
 
 Design decisions worth revisiting are collected in DESIGN NOTE comments
 throughout.
@@ -34,21 +48,27 @@ import hashlib
 import io
 import json
 import os
+import random
 import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator, Literal, Coroutine, Any
+from typing import AsyncIterator, Literal, Coroutine, Any, Sequence
 
 import numpy as np
+import openai
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel
 
-from .arc_line_vectorization_suede.visualize import commands_to_svg
+from .arc_line_vectorization_suede.visualize import (
+    commands_to_svg,
+    DrawingCommand as VectorDrawingCommand,
+)
 from .combine import Combine
+from .common import SuccessResponse, require_admin
 from .robots import DrawingCommand, coordinator, enqueue_drawing, parse_commands
 from .storage import StoredResource, storage
 from .vectorize import run_vectorization
@@ -57,6 +77,30 @@ from .vectorize import run_vectorization
 
 # How many approved sketches make a trio that gets combined + vectorized.
 TRIO_SIZE = 3
+
+# How many independent combine+vectorize runs are offered to the admin per trio.
+# The admin picks the best of these. Fixed at 2 to match the two-option shape of
+# Admin.Vectorization.SSEPayload.command_options — bump both together if changed.
+VECTORIZATION_OPTIONS = 2
+
+# Cap on how many combine (GPT Image 1) calls may be in flight at once, across
+# every trio. OpenAI enforces per-minute rate limits (RPM / images-per-minute,
+# tiered by usage) rather than a hard concurrency cap; a global gate keeps bursts
+# under those limits, and the retry-with-backoff below absorbs the occasional 429
+# that still slips through. Each trio issues VECTORIZATION_OPTIONS calls, so
+# without this the in-flight count is 2 x (concurrent trios), unbounded. Default
+# 50 suits a Tier 5 org (whose image limits are in the thousands/min); lower it
+# on smaller tiers via the env var.
+MAX_CONCURRENT_COMBINES = int(os.environ.get("V2_MAX_CONCURRENT_COMBINES", "50"))
+
+# Retry-with-backoff around the combine call, for rate-limit (429) and transient
+# server/connection errors. On each retry we wait an exponentially-growing delay
+# with full jitter (or the server's Retry-After, if given), capped at
+# COMBINE_BACKOFF_MAX. The gate slot is released while backing off so a rate-
+# limited call doesn't hold up others. Set retries to 0 to disable.
+COMBINE_MAX_RETRIES = int(os.environ.get("V2_COMBINE_MAX_RETRIES", "5"))
+COMBINE_BACKOFF_BASE = float(os.environ.get("V2_COMBINE_BACKOFF_BASE", "1.0"))
+COMBINE_BACKOFF_MAX = float(os.environ.get("V2_COMBINE_BACKOFF_MAX", "30.0"))
 
 # The image model + prompt used to combine a trio into one drawing.
 COMBINE_MODEL = "gpt-image-1"
@@ -116,7 +160,7 @@ SketchStatus = Literal["approved", "innapropriate", "complex"]
 RobotKind = Literal["doughnut"]
 
 
-class SSEPayload(BaseModel):
+class ClientSSEPayload(BaseModel):
     """One update pushed to a client over the SSE feed. Matches the client's
     ``SSEPayload`` type exactly, including the (intentional) ``innapropriate``
     spelling. Optional fields are omitted on the wire via ``exclude_none``."""
@@ -145,6 +189,50 @@ class SketchRequest(BaseModel):
 
 class SketchResponse(BaseModel):
     sketch: str
+
+
+class Admin:
+    class Sketch:
+        class SSEPayload(BaseModel):
+            type: Literal["sketch"]
+            sketch_id: str
+
+        class Request(BaseModel):
+            """How the admin client responds"""
+
+            sketch_id: str
+            status: SketchStatus
+
+    class Vectorization:
+        class SSEPayload(BaseModel):
+            type: Literal["vectorization"]
+            vectorization_id: str
+
+            source_trio: tuple[str, str, str]
+            """
+            The three source sketch ids the trio was combined from. Each is also a
+            /resource/{id} locator for that sketch's PNG, so the admin can judge a
+            vectorization against the drawings that produced it.
+            """
+
+            command_options: tuple[list[DrawingCommand], list[DrawingCommand]]
+            """
+            Two independently-combined vectorizations of the same trio. The admin
+            picks whichever reads best and trims any unnecessary parts; the chosen
+            (and possibly edited) list is returned in the Request.
+            """
+
+        class Request(BaseModel):
+            """How the admin client responds"""
+
+            vectorization_id: str
+
+            commands: list[DrawingCommand]
+            """
+            The command list the admin selected (from ``command_options``) and
+            optionally trimmed. This is drawable as-is: it is re-vectorized to an
+            SVG, stored at ``vectorization_id``, and dispatched to a robot.
+            """
 
 
 # --- Server-side domain model ---------------------------------------------
@@ -183,7 +271,7 @@ class Sketch:
     state: ServerState = "approval-pending"
     # The full ordered log of every payload emitted for this sketch, so a
     # reconnecting client can be replayed back to the sketch's current state.
-    events: list[SSEPayload] = field(default_factory=list)
+    events: list[ClientSSEPayload] = field(default_factory=list)
 
     def to_meta(self) -> dict:
         return {
@@ -201,7 +289,7 @@ class Sketch:
             client_id=meta["client_id"],
             created=meta.get("created", ""),
             state=meta.get("state", "approval-pending"),
-            events=[SSEPayload(**e) for e in meta.get("events", [])],
+            events=[ClientSSEPayload(**e) for e in meta.get("events", [])],
         )
 
 
@@ -238,9 +326,23 @@ class _Group:
             # A full companion list means the trio is complete → start combining.
             member.state = "combining" if full else "approved"
             self.manager._emit(
-                member, SSEPayload(sketch=member_id, companions=companions)
+                member, ClientSSEPayload(sketch=member_id, companions=companions)
             )
         return full
+
+
+@dataclass
+class _PendingVectorization:
+    """A combined trio's vectorization options waiting on the admin's choice.
+
+    Held out of every client's feed until the admin picks a drawing — the admin
+    reviews two independently-combined ``command_options`` (against the source
+    trio) and returns the chosen, possibly-trimmed list. ``id`` is the stable
+    resource locator the served SVG is stored under once chosen."""
+
+    id: str
+    trio_ids: list[str]
+    command_options: list[list[DrawingCommand]]
 
 
 class Manager:
@@ -267,6 +369,18 @@ class Manager:
         self._forming = _Group(self)
         # Keep strong references to background tasks so they aren't GC'd.
         self._tasks: set[asyncio.Task[None]] = set()
+        # Process-wide gate bounding concurrent OpenAI combine calls. Built lazily
+        # in the running loop (see _combine_gate).
+        self._combine_gate_sem: "asyncio.Semaphore | None" = None
+        self._combine_gate_loop: "asyncio.AbstractEventLoop | None" = None
+        # -- admin approval state --------------------------------------------
+        # Live admin SSE subscribers (see subscribe_admin). A fresh connection is
+        # replayed the current backlog below, then fed live notifications.
+        self._admin_subscribers: set["asyncio.Queue[str]"] = set()
+        # Sketches parked in "approval-pending", keyed by id, awaiting a verdict.
+        self.pending_sketches: dict[str, Sketch] = {}
+        # Combined vectorizations awaiting a verdict, keyed by their locator id.
+        self.pending_vectorizations: dict[str, _PendingVectorization] = {}
         self._load_from_disk()
 
     # -- startup recovery ---------------------------------------------------
@@ -318,6 +432,36 @@ class Manager:
         if client is not None:
             client.subscribers.discard(queue)
 
+    # -- admin feed ---------------------------------------------------------
+
+    def subscribe_admin(self) -> "asyncio.Queue[str]":
+        """Register a live admin SSE subscriber, pre-loaded with everything that
+        currently needs a verdict. Synchronous (no awaits) so the backlog snapshot
+        + registration is atomic against concurrently-emitted pending items.
+
+        Replay is a snapshot of the *outstanding* work — pending sketches then
+        pending vectorizations — not a full history: once an item is resolved it
+        no longer concerns the admin, so a reconnecting admin only sees what's
+        still open."""
+        queue: "asyncio.Queue[str]" = asyncio.Queue()
+        self._admin_subscribers.add(queue)
+        for sketch in self.pending_sketches.values():
+            queue.put_nowait(
+                _encode_admin(Admin.Sketch.SSEPayload(type="sketch", sketch_id=sketch.id))
+            )
+        for pending in self.pending_vectorizations.values():
+            queue.put_nowait(_encode_admin(_vectorization_payload(pending)))
+        return queue
+
+    def unsubscribe_admin(self, queue: "asyncio.Queue[str]") -> None:
+        self._admin_subscribers.discard(queue)
+
+    def _notify_admin(self, payload: BaseModel) -> None:
+        """Fan an admin payload out to every live admin feed."""
+        data = _encode_admin(payload)
+        for queue in self._admin_subscribers:
+            queue.put_nowait(data)
+
     # -- resources ----------------------------------------------------------
 
     def get_resource(self, resource_id: str) -> StoredResource | None:
@@ -363,6 +507,21 @@ class Manager:
             )
         return resource_id
 
+    def _register_resource_at(
+        self, resource_id: str, body: bytes, content_type: str
+    ) -> None:
+        """Upload ``body`` under a caller-chosen ``resource_id`` and register it as
+        servable. Unlike ``_store_resource`` the id is *not* the content hash — it's
+        a stable locator handed out ahead of the bytes (an admin-approved
+        vectorization; see _request_vectorization_approval).
+
+        Blocking (S3 PUT) — call it via ``asyncio.to_thread`` from async code."""
+        storage.put_resource_at(resource_id, body, content_type)
+        self.resources[resource_id] = StoredResource(
+            key=storage.resource_key(resource_id, content_type),
+            content_type=content_type,
+        )
+
     # -- sketches -----------------------------------------------------------
 
     async def store_sketch(self, client_id: str, data_url: str) -> str:
@@ -392,8 +551,8 @@ class Manager:
         # The creation event materialises the pipeline on the client. (A live
         # submission already created it eagerly and treats this as a no-op; a
         # reconnecting client needs it to rebuild the model.)
-        self._emit(sketch, SSEPayload(sketch=sketch_id))
-        self._spawn(self._review(sketch))
+        self._emit(sketch, ClientSSEPayload(sketch=sketch_id))
+        self._request_sketch_approval(sketch)
         return sketch_id
 
     def _persist(self, sketch: Sketch) -> None:
@@ -403,7 +562,7 @@ class Manager:
 
     # -- event emission -----------------------------------------------------
 
-    def _emit(self, sketch: Sketch, payload: SSEPayload) -> None:
+    def _emit(self, sketch: Sketch, payload: ClientSSEPayload) -> None:
         """Append to the sketch's log, persist, and fan out to live feeds."""
         sketch.events.append(payload)
         self._persist(sketch)
@@ -413,42 +572,76 @@ class Manager:
             for queue in owner.subscribers:
                 queue.put_nowait(data)
 
-    # -- pipeline orchestration --------------------------------------------
+    # -- sketch approval (admin) -------------------------------------------
 
-    async def _review(self, sketch: Sketch) -> None:
-        """Moderate the sketch, then either reject it or admit it to a trio."""
-        status = await _classify(self.get_resource(sketch.id))
+    def _request_sketch_approval(self, sketch: Sketch) -> None:
+        """Park a freshly-submitted sketch for an admin verdict and notify the
+        admin feed. The sketch sits in "approval-pending" (its default state, out
+        of the grouping pool) and its owner sees only the creation event until the
+        admin decides — so nothing about it reaches the client, not even a status,
+        before a human has looked at it.
+
+        DESIGN NOTE (durability): the parked sketch is *not* re-queued to the admin
+        after a server restart. The blob and event log persist, but resuming the
+        approval hand-off is in-flight pipeline state, which — consistent with the
+        combine/robot stages — is not resumed. See the Manager durability note."""
+        self.pending_sketches[sketch.id] = sketch
+        self._notify_admin(
+            Admin.Sketch.SSEPayload(type="sketch", sketch_id=sketch.id)
+        )
+
+    def resolve_sketch(self, sketch_id: str, status: SketchStatus) -> None:
+        """Apply an admin's verdict on a pending sketch. Synchronous (no awaits)
+        so admit-to-trio is atomic against other approvals on the event loop.
+
+        The verdict becomes the client's ``status``: "approved" moves the sketch
+        into the grouping pool exactly as the old auto-classifier did; the
+        "innapropriate"/"complex" verdicts are terminal — the client learns why
+        and the sketch never groups."""
+        sketch = self.sketches.get(sketch_id)
+        if sketch is None:
+            raise HTTPException(status_code=404, detail="unknown sketch")
+        if self.pending_sketches.pop(sketch_id, None) is None:
+            raise HTTPException(
+                status_code=409, detail="sketch is not awaiting approval"
+            )
 
         if status != "approved":
-            # "innapropriate" / "complex" are terminal — the sketch never groups.
-            sketch.state = "approval-pending"  # stays out of the pool
-            self._emit(sketch, SSEPayload(sketch=sketch.id, status=status))
+            # Terminal. Keep it in "approval-pending" (out of the pool); the client
+            # learns the verdict via the status field.
+            self._emit(sketch, ClientSSEPayload(sketch=sketch_id, status=status))
             return
 
         sketch.state = "approved"
-        self._emit(sketch, SSEPayload(sketch=sketch.id, status="approved"))
+        self._emit(sketch, ClientSSEPayload(sketch=sketch_id, status="approved"))
 
         # DESIGN NOTE (incremental grouping): admit the newly-approved sketch to
         # the forming trio right now. Everyone already waiting learns about it
         # immediately, and it learns about them — this is the "pair the moment
         # there's more than one" behaviour the test server flagged as a TODO.
-        # The whole read-modify-write below is synchronous, so it is atomic
-        # against other approvals landing on the event loop.
         if self._forming.admit(sketch):
             trio = self._forming.members
             self._forming = _Group(self)
             self._spawn(self._combine(trio))
 
+    # -- pipeline orchestration --------------------------------------------
+
     async def _combine(self, trio_ids: list[str]) -> None:
-        """Combine a full trio into one drawing, vectorize it, hand every member
-        the same vectorization resource, dispatch it to a real robot, then
-        complete the pipeline once a bot has claimed the drawing."""
-        trio = [self.sketches[sid] for sid in trio_ids]
+        """Combine a full trio into VECTORIZATION_OPTIONS independent drawings,
+        vectorize each, then hand both options to the admin to choose from.
+        Nothing reaches the trio's clients here — they stay in "combining" until
+        the admin picks a vectorization."""
         trio_resources = [self.resources[sid] for sid in trio_ids]
 
         try:
-            vectorization_id, commands = await self._combine_and_vectorize(
-                trio_resources
+            # Two independent combine+vectorize runs (GPT Image 1 is
+            # non-deterministic, so the same trio yields two distinct options).
+            # Run them concurrently; both must succeed to offer a real choice.
+            options = await asyncio.gather(
+                *(
+                    self._combine_and_vectorize(trio_resources)
+                    for _ in range(VECTORIZATION_OPTIONS)
+                )
             )
         except Exception as exc:  # noqa: BLE001
             # DESIGN NOTE (failure surface): the wire protocol has no "failed"
@@ -458,15 +651,66 @@ class Manager:
             print(f"[v2] combine pipeline failed for {trio_ids}: {exc}")
             return
 
+        self._request_vectorization_approval(trio_ids, list(options))
+
+    # -- vectorization choice (admin) --------------------------------------
+
+    def _request_vectorization_approval(
+        self, trio_ids: list[str], command_options: list[list[DrawingCommand]]
+    ) -> None:
+        """Park a combined trio's vectorization options for the admin's choice and
+        notify the admin feed with both option sets plus the source trio.
+
+        The locator is a fresh, non-content-addressed id: the served SVG doesn't
+        exist yet (the admin picks + trims the commands), so the id is minted up
+        front and the blob is filled in under it once chosen. The trio stays in
+        "combining" — no ``vectorization`` reaches any client until then."""
+        vectorization_id = uuid.uuid4().hex
+        pending = _PendingVectorization(
+            id=vectorization_id,
+            trio_ids=list(trio_ids),
+            command_options=command_options,
+        )
+        self.pending_vectorizations[vectorization_id] = pending
+        self._notify_admin(_vectorization_payload(pending))
+
+    def resolve_vectorization(self, req: "Admin.Vectorization.Request") -> None:
+        """Record the admin's chosen (and possibly trimmed) command list for a
+        pending vectorization. Synchronous and fast: the actual finalize (render +
+        store + robot dispatch, which can block for a robot assignment) runs as a
+        background task so the admin's HTTP call returns immediately.
+
+        Every response is a drawable vectorization — there is no reject path."""
+        pending = self.pending_vectorizations.pop(req.vectorization_id, None)
+        if pending is None:
+            raise HTTPException(
+                status_code=404, detail="unknown or already-resolved vectorization"
+            )
+        self._spawn(self._finalize_vectorization(pending, req.commands))
+
+    async def _finalize_vectorization(
+        self, pending: _PendingVectorization, commands: list[DrawingCommand]
+    ) -> None:
+        """Render the chosen commands to the served SVG, store it under the
+        vectorization's locator id, reveal it to every trio member, and dispatch
+        the drawing to a robot."""
+        trio = [self.sketches[sid] for sid in pending.trio_ids]
+
+        svg = _render_commands_svg(commands)
+        await asyncio.to_thread(
+            self._register_resource_at, pending.id, svg.encode("utf-8"), "image/svg+xml"
+        )
+
         for sketch in trio:
             sketch.state = "robot-selection"
             self._emit(
-                sketch, SSEPayload(sketch=sketch.id, vectorization=vectorization_id)
+                sketch,
+                ClientSSEPayload(sketch=sketch.id, vectorization=pending.id),
             )
 
         # Dispatch the vectorized drawing to the robot pool and wait for a real
         # Doodlebot to claim it before advancing every member to "complete".
-        await self._dispatch_to_robot(trio, commands, source=vectorization_id)
+        await self._dispatch_to_robot(trio, commands, source=pending.id)
 
     async def _dispatch_to_robot(
         self, trio: list[Sketch], commands: list[DrawingCommand], source: str
@@ -507,23 +751,27 @@ class Manager:
                 sketch.state = "complete"
                 color = coordinator.color_for_robot(assigned)
                 self._emit(
-                    sketch, SSEPayload(sketch=sketch.id, robot=assigned, color=color)
+                    sketch,
+                    ClientSSEPayload(sketch=sketch.id, robot=assigned, color=color),
                 )
         else:
             for sketch in trio:
                 sketch.state = "complete"
                 self._emit(
                     sketch,
-                    SSEPayload(sketch=sketch.id, robot="<invalid>"),
+                    ClientSSEPayload(sketch=sketch.id, robot="<invalid>"),
                 )
 
     async def _combine_and_vectorize(
         self, resources: list[StoredResource]
-    ) -> tuple[str, list[DrawingCommand]]:
-        """Run GPT Image 1 over the trio and vectorize the result. Returns the
-        served SVG's resource id plus the low-geometry drawing commands (for
-        robot dispatch). Retries the whole (network + CPU) chain a couple of
-        times before giving up."""
+    ) -> list[DrawingCommand]:
+        """Run GPT Image 1 over the trio and vectorize the result into the
+        low-geometry drawing commands (for admin review + robot dispatch). Retries
+        the whole (network + CPU) chain a couple of times before giving up.
+
+        No SVG is stored here: the servable image is only rendered once the admin
+        has approved (and possibly simplified) these commands — see
+        _finalize_vectorization."""
         last_exc: Exception | None = None
         for attempt in range(1, PIPELINE_ATTEMPTS + 1):
             try:
@@ -532,9 +780,7 @@ class Manager:
                 images = await asyncio.to_thread(
                     lambda: [storage.read(r.key) for r in resources]
                 )
-                image_b64 = await asyncio.to_thread(
-                    Combine.openai_s3, COMBINE_MODEL, images, COMBINE_PROMPT
-                )
+                image_b64 = await self._combine_call(images)
                 combined_png = base64.b64decode(image_b64)
 
                 ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
@@ -542,21 +788,61 @@ class Manager:
                     storage.put_combined_debug, combined_png, f"combined_{ts}.png"
                 )
 
-                # 2) Vectorize the combined drawing into robot strokes: the
-                #    low-geometry commands drive the robot; we also render them to
-                #    a clean black-line SVG (no pen-up travel moves) to serve.
-                commands, svg = await asyncio.to_thread(
-                    _vectorize_for_robot_and_svg, combined_png
+                # 2) Vectorize the combined drawing into the low-geometry robot
+                #    strokes. These are what the admin reviews and what ultimately
+                #    drives the robot.
+                commands = await asyncio.to_thread(
+                    _vectorize_for_robot, combined_png
                 )
-                vectorization_id = await asyncio.to_thread(
-                    self._store_resource, svg.encode("utf-8"), "image/svg+xml"
-                )
-                return vectorization_id, commands
+                return commands
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
                 print(f"[v2] combine/vectorize attempt {attempt} failed: {exc}")
         assert last_exc is not None
         raise last_exc
+
+    def _combine_gate(self) -> "asyncio.Semaphore":
+        """The process-wide semaphore bounding concurrent OpenAI combine calls.
+
+        Created lazily inside the running loop (and rebuilt if the loop changes,
+        e.g. between tests) so the semaphore is never awaited from a loop other
+        than the one it was created on."""
+        loop = asyncio.get_running_loop()
+        if self._combine_gate_sem is None or self._combine_gate_loop is not loop:
+            self._combine_gate_sem = asyncio.Semaphore(MAX_CONCURRENT_COMBINES)
+            self._combine_gate_loop = loop
+        return self._combine_gate_sem
+
+    async def _combine_call(self, images: list[bytes]) -> str:
+        """Run one GPT Image 1 combine, gated for concurrency and retried with
+        backoff on rate-limit / transient errors. Returns the combined PNG as
+        base64.
+
+        The gate is acquired *per attempt* and released while backing off, so a
+        rate-limited call frees its slot for others instead of holding it idle
+        through the wait."""
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                # Gate only the OpenAI call — the rate-limited resource — so no
+                # more than MAX_CONCURRENT_COMBINES are ever in flight at once,
+                # however many trios are combining. S3 reads + vectorization
+                # aren't gated.
+                async with self._combine_gate():
+                    return await asyncio.to_thread(
+                        Combine.openai_s3, COMBINE_MODEL, images, COMBINE_PROMPT
+                    )
+            except Exception as exc:  # noqa: BLE001
+                if attempt > COMBINE_MAX_RETRIES or not _is_retryable(exc):
+                    raise
+                delay = _combine_backoff(attempt, exc)
+                print(
+                    f"[v2] combine call hit {type(exc).__name__} "
+                    f"(attempt {attempt}/{COMBINE_MAX_RETRIES}); "
+                    f"retrying in {delay:.1f}s"
+                )
+                await asyncio.sleep(delay)
 
     # -- task bookkeeping ---------------------------------------------------
 
@@ -566,52 +852,115 @@ class Manager:
         task.add_done_callback(self._tasks.discard)
 
 
-# --- moderation ------------------------------------------------------------
+# --- combine retry/backoff -------------------------------------------------
 
 
-async def _classify(resource: StoredResource | None) -> SketchStatus:
-    """Classify a submitted sketch as approved / innapropriate / complex.
+def _is_retryable(exc: Exception) -> bool:
+    """Whether a failed combine call is worth retrying: OpenAI rate limits (429)
+    and transient server/connection errors, not client errors (bad request, auth)
+    which would just fail again."""
+    if isinstance(
+        exc,
+        (
+            openai.RateLimitError,
+            openai.APITimeoutError,
+            openai.APIConnectionError,
+            openai.InternalServerError,
+        ),
+    ):
+        return True
+    # Fall back to the status code for anything that isn't one of those exact
+    # types (e.g. a wrapped/re-raised error, or a test double).
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
+    return status == 429 or (isinstance(status, int) and 500 <= status < 600)
 
-    DESIGN NOTE (moderation): this is the seam where real moderation goes. The
-    test server approved everything; production needs both a safety check
-    (inappropriate content) and a tractability check (too complex to combine or
-    vectorize well). Both want a vision model call — e.g. OpenAI's moderation /
-    a vision classifier — and are intentionally left as a clearly-marked hook
-    rather than guessed at, since no moderation model was specified.
 
-    Defaults to "approved" so the combine + vectorize path is exercised end to
-    end. Wire a classifier in here; it may run via asyncio.to_thread.
-    """
-    return "approved"
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """The server-requested wait from a Retry-After header, if the error carries
+    one — respected over our own backoff so we don't hammer ahead of the reset."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    value = headers.get("retry-after")
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _combine_backoff(attempt: int, exc: Exception) -> float:
+    """Seconds to wait before combine retry ``attempt`` (1-based). Prefers the
+    server's Retry-After; otherwise exponential backoff with full jitter, capped
+    at COMBINE_BACKOFF_MAX."""
+    retry_after = _retry_after_seconds(exc)
+    if retry_after is not None:
+        return retry_after
+    ceiling = min(COMBINE_BACKOFF_MAX, COMBINE_BACKOFF_BASE * (2 ** (attempt - 1)))
+    return random.uniform(0.0, ceiling)
+
+
+# --- admin feed encoding ---------------------------------------------------
+
+
+def _encode_admin(payload: BaseModel) -> str:
+    """Serialize an admin SSE payload. Both payload types carry a ``type``
+    discriminator ("sketch"/"vectorization") so the single admin feed can
+    interleave them and the front-end can tell them apart."""
+    return payload.model_dump_json()
+
+
+def _vectorization_payload(
+    pending: "_PendingVectorization",
+) -> "Admin.Vectorization.SSEPayload":
+    """Build the admin SSE payload for a pending vectorization: the source trio's
+    sketch ids plus both command options. Shared by the live notify and the
+    on-connect backlog replay so the two never drift."""
+    trio = pending.trio_ids
+    options = pending.command_options
+    return Admin.Vectorization.SSEPayload(
+        type="vectorization",
+        vectorization_id=pending.id,
+        source_trio=(trio[0], trio[1], trio[2]),
+        command_options=(options[0], options[1]),
+    )
 
 
 # --- vectorization helper --------------------------------------------------
 
 
-def _vectorize_for_robot_and_svg(png_bytes: bytes) -> tuple[list[DrawingCommand], str]:
-    """Vectorize a combined PNG into the low-geometry (robot-drawn) commands and
-    a clean standalone SVG rendered from those same commands.
-
-    Runs the existing pipeline (release/vectorize.py). The low-geometry commands
-    are what the robot actually draws (and what we hand to robot dispatch); we
-    re-render them with pen-up travel moves hidden so the served image is just
-    the black contour, matching the zen aesthetic rather than the debug SVG."""
-    pil = Image.open(io.BytesIO(png_bytes))
-    pil.load()
-    result = run_vectorization(np.asarray(pil))
-    # run_vectorization returns commands as plain JSON-able dicts. commands_to_svg
-    # consumes that dict form directly, but robot dispatch needs the typed
-    # DrawingCommand models (attribute access), so parse them for the return.
-    raw_commands = result["low_geometry"]
-    svg = commands_to_svg(
-        raw_commands,
+def _commands_to_svg(commands: Sequence[VectorDrawingCommand]):
+    return commands_to_svg(
+        commands,
         show_pen_up=False,
         stroke_width=4.0,
         stroke="black",
         show_endpoints=False,
     )
-    commands = parse_commands(raw_commands)
-    return commands, svg
+
+
+def _vectorize_for_robot(png_bytes: bytes) -> list[DrawingCommand]:
+    """Vectorize a combined PNG into the low-geometry (robot-drawn) commands.
+
+    Runs the existing pipeline (release/vectorize.py). run_vectorization returns
+    commands as plain JSON-able dicts; robot dispatch and the admin payload need
+    the typed DrawingCommand models (attribute access), so parse them here."""
+    pil = Image.open(io.BytesIO(png_bytes))
+    pil.load()
+    result = run_vectorization(np.asarray(pil))
+    return parse_commands(result["low_geometry"])
+
+
+def _render_commands_svg(commands: list[DrawingCommand]) -> str:
+    """Render approved (possibly admin-simplified) drawing commands to a clean
+    standalone SVG — pen-up travel moves hidden so the served image is just the
+    black contour. The typed models are dumped back to the dict form
+    commands_to_svg consumes."""
+    return _commands_to_svg([command.model_dump() for command in commands])
 
 
 # --- misc helpers ----------------------------------------------------------
@@ -706,3 +1055,66 @@ async def events(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+# --- admin routes ----------------------------------------------------------
+#
+# DESIGN NOTE (admin auth): all three routes are gated by require_admin (from
+# .common), so they share the X-Admin-Token header / ?token= query auth the v1
+# admin flow uses. The admin front-end is built separately; these endpoints are
+# its whole contract.
+
+
+@router.get("/admin/events")
+async def admin_events(request: Request) -> StreamingResponse:
+    """SSE feed of everything awaiting an admin verdict: on connect, a snapshot of
+    the current backlog (pending sketches, then pending vectorizations), then live
+    items as they appear. Each frame is a JSON payload discriminated by ``type``
+    ("sketch" | "vectorization")."""
+    require_admin(request)
+    queue = manager.subscribe_admin()
+
+    async def stream() -> AsyncIterator[str]:
+        try:
+            yield ": connected\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT)
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"  # comment frame; ignored by EventSource
+                    continue
+                yield f"data: {data}\n\n"
+        finally:
+            manager.unsubscribe_admin(queue)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/admin/sketch", response_model=SuccessResponse)
+async def admin_resolve_sketch(
+    request: Request, payload: Admin.Sketch.Request
+) -> SuccessResponse:
+    """Record an admin's verdict on a pending sketch. The ``sketch_id`` locates
+    the sketch; the ``status`` becomes the client's status (approved → grouping;
+    innapropriate/complex → terminal)."""
+    require_admin(request)
+    manager.resolve_sketch(payload.sketch_id, payload.status)
+    return SuccessResponse()
+
+
+@router.post("/admin/vectorization", response_model=SuccessResponse)
+async def admin_resolve_vectorization(
+    request: Request, payload: Admin.Vectorization.Request
+) -> SuccessResponse:
+    """Record an admin's verdict on a pending vectorization. Approve as-is, approve
+    with a simplified ``commands`` set, or reject (regenerates a fresh candidate).
+    Returns immediately; the render + robot dispatch runs in the background."""
+    require_admin(request)
+    manager.resolve_vectorization(payload)
+    return SuccessResponse()
