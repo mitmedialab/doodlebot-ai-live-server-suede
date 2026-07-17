@@ -48,6 +48,7 @@ from typing import (
 
 import numpy as np
 from PIL import Image, ImageDraw
+from pydantic import BaseModel
 
 # --------------------------------------------------------------------------- #
 # Command protocol (duck-typed against robots.py's pydantic models)
@@ -81,6 +82,14 @@ CommandT = TypeVar("CommandT", bound=Command)
 
 Point = tuple[float, float]
 Stroke = list[Point]  # a contiguous pen-down polyline, in drawing-local mm
+
+
+class Pose(BaseModel):
+    """A position plus a heading (degrees, CCW positive, matching the vectorizer)."""
+
+    x: float
+    y: float
+    headingDegrees: float = 0.0
 
 
 # --------------------------------------------------------------------------- #
