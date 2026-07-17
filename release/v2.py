@@ -29,7 +29,9 @@ Admin routes (gated by ``require_admin``; a separate admin front-end drives them
 
   GET  /admin/events           -> text/event-stream of items awaiting approval
   POST /admin/sketch           -> record an admin's verdict on a sketch
-  POST /admin/vectorization    -> approve / simplify / reject a vectorization
+  POST /admin/vectorization    -> choose a vectorization's final commands
+  GET  /admin/sessions         -> the active session tokens
+  POST /admin/sessions         -> replace the active session tokens
 
 DESIGN NOTE (admin as resource locators): like ``ClientSSEPayload``'s ids, the
 ``sketch_id`` and ``vectorization_id`` the admin stream hands out are opaque
@@ -153,10 +155,20 @@ SKETCH_META_DIR = V2_DATA_DIR / "sketches"  # per-sketch JSON: state + event log
 for _d in (V2_DATA_DIR, SKETCH_META_DIR):
     _d.mkdir(parents=True, exist_ok=True)
 
+# The admin-configured active session tokens live here (JSON: {"sessions": [...]}).
+# Unlike in-flight pipeline state, this is durable *config*, so it is loaded on
+# startup and rewritten on every change — it survives restarts.
+SESSIONS_FILE = V2_DATA_DIR / "sessions.json"
+
 
 # --- Wire types (must mirror the client's types) ---------------------------
 
+# The admin's moderation verdicts, carried on the client SSE feed's ``status``.
 SketchStatus = Literal["approved", "innapropriate", "complex"]
+# The synchronous rejection returned from POST /sketch when the submission's
+# session token isn't active. Distinct from SketchStatus: it's decided at
+# submission time (not by an admin) and never enters the moderation pipeline.
+SubmissionRejection = Literal["inactive session"]
 RobotKind = Literal["doughnut"]
 
 
@@ -182,6 +194,10 @@ class ClientResponse(BaseModel):
 
 class SketchRequest(BaseModel):
     client: str
+    """The session token the submission was made under (collected by the client
+    from its URL). Empty or unknown ⇒ the sketch is rejected as "inactive
+    session"; it must match one of the admin's active sessions to be accepted."""
+    session: str = ""
     """The image content, as a ``data:image/png;base64,...`` URL exported by the
     client's SketchPad."""
     sketch: str
@@ -189,6 +205,9 @@ class SketchRequest(BaseModel):
 
 class SketchResponse(BaseModel):
     sketch: str
+    # Set only when the submission was rejected up-front for an inactive session;
+    # omitted (None) when the sketch was accepted into the moderation pipeline.
+    status: SubmissionRejection | None = None
 
 
 class Admin:
@@ -261,6 +280,14 @@ class Admin:
             optionally trimmed. This is drawable as-is: it is re-vectorized to an
             SVG, stored at ``vectorization_id``, and dispatched to a robot.
             """
+
+    class Sessions:
+        class Config(BaseModel):
+            """The complete set of active session tokens. A sketch is accepted only
+            if its ``session`` matches one of these. Used by both admin session
+            endpoints: GET returns the current set, POST replaces it wholesale."""
+
+            sessions: list[str]
 
 
 # Resolve the forward reference to the (nested) SubmitterStats now that Admin
@@ -425,6 +452,9 @@ class Manager:
         # admin resolve is an idempotent no-op rather than a 404. Ids are short
         # hex strings and trios are infrequent, so this set stays tiny.
         self.resolved_vectorizations: set[str] = set()
+        # Admin-configured active session tokens. A sketch is accepted only if its
+        # submission's session is in here. Loaded from disk below.
+        self.active_sessions: set[str] = set()
         self._load_from_disk()
 
     # -- startup recovery ---------------------------------------------------
@@ -436,6 +466,7 @@ class Manager:
         The resource catalogue is enumerated from S3 (blocking, but this runs at
         construction time before the event loop is serving)."""
         self.resources = storage.list_resources()
+        self._load_sessions()
 
         metas: list[Sketch] = []
         for path in sorted(SKETCH_META_DIR.glob("*.json")):
@@ -449,6 +480,39 @@ class Manager:
                 continue
             self.sketches[sketch.id] = sketch
             self.ensure_client(sketch.client_id).sketch_ids.append(sketch.id)
+
+    # -- sessions -----------------------------------------------------------
+
+    def _load_sessions(self) -> None:
+        """Restore the admin's active session tokens from disk (empty if none)."""
+        if not SESSIONS_FILE.exists():
+            return
+        try:
+            data = json.loads(SESSIONS_FILE.read_text())
+            self.active_sessions = set(data.get("sessions", []))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[v2] could not load sessions from {SESSIONS_FILE.name}: {exc}")
+
+    def _persist_sessions(self) -> None:
+        SESSIONS_FILE.write_text(
+            json.dumps({"sessions": sorted(self.active_sessions)})
+        )
+
+    def is_active_session(self, session: str) -> bool:
+        """Whether a submission's session token is currently active. An empty or
+        unknown token is never active (so a sketch without a valid session link is
+        rejected rather than erroring)."""
+        return bool(session) and session in self.active_sessions
+
+    def get_active_sessions(self) -> list[str]:
+        return sorted(self.active_sessions)
+
+    def set_active_sessions(self, sessions: list[str]) -> None:
+        """Replace the active session set wholesale (the admin sends the complete
+        desired list) and persist it. Blank tokens are dropped. Only gates *new*
+        submissions — sketches already in the pipeline are unaffected."""
+        self.active_sessions = {s for s in sessions if s}
+        self._persist_sessions()
 
     # -- clients ------------------------------------------------------------
 
@@ -566,17 +630,30 @@ class Manager:
 
     # -- sketches -----------------------------------------------------------
 
-    async def store_sketch(self, client_id: str, data_url: str) -> str:
-        """Persist a submitted sketch and kick off its pipeline. Returns the
-        sha256 content id. Idempotent for a re-submitted identical sketch."""
+    async def store_sketch(
+        self, client_id: str, session: str, data_url: str
+    ) -> SketchResponse:
+        """Validate the submission's session, then (if active) persist the sketch
+        and kick off its pipeline. Returns the sha256 content id, plus a
+        ``status`` of "inactive session" when the session gate rejected it.
+
+        The session check comes first and, on failure, short-circuits before any
+        state is created or any blob is uploaded — an inactive session never
+        touches storage, the admin queue, or the submitter stats. Idempotent for a
+        re-submitted identical sketch."""
         content_type, body = _decode_data_url(data_url)
         sketch_id = hashlib.sha256(body).hexdigest()
+
+        if not self.is_active_session(session):
+            # Rejected up front — no client/sketch/resource state is created, so a
+            # bad-session flood can't fill storage or the admin queue.
+            return SketchResponse(sketch=sketch_id, status="inactive session")
 
         client = self.ensure_client(client_id)
 
         if sketch_id in self.sketches:
             # Same content submitted again — hand back the existing id untouched.
-            return sketch_id
+            return SketchResponse(sketch=sketch_id)
 
         # Reserve the sketch synchronously (before any await) so two concurrent
         # identical submissions dedup to one pipeline rather than racing.
@@ -595,7 +672,7 @@ class Manager:
         # reconnecting client needs it to rebuild the model.)
         self._emit(sketch, ClientSSEPayload(sketch=sketch_id))
         self._request_sketch_approval(sketch)
-        return sketch_id
+        return SketchResponse(sketch=sketch_id)
 
     def _persist(self, sketch: Sketch) -> None:
         """Write the sketch's current state + event log to disk. Small JSON, so
@@ -1096,8 +1173,10 @@ async def request_client() -> ClientResponse:
 
 @router.post("/sketch", response_model=SketchResponse)
 async def store_sketch(request: SketchRequest) -> SketchResponse:
-    sketch_id = await manager.store_sketch(request.client, request.sketch)
-    return SketchResponse(sketch=sketch_id)
+    """Accept a sketch submission. A ``status`` of "inactive session" in the
+    response means the submission's ``session`` wasn't active and nothing was
+    stored; otherwise the sketch entered the moderation pipeline."""
+    return await manager.store_sketch(request.client, request.session, request.sketch)
 
 
 @router.get("/resource/{resource_id}")
@@ -1202,9 +1281,28 @@ async def admin_resolve_sketch(
 async def admin_resolve_vectorization(
     request: Request, payload: Admin.Vectorization.Request
 ) -> SuccessResponse:
-    """Record an admin's verdict on a pending vectorization. Approve as-is, approve
-    with a simplified ``commands`` set, or reject (regenerates a fresh candidate).
+    """Record the admin's chosen (and optionally trimmed) command list for a
+    pending vectorization. Idempotent: a duplicate/second-admin resolve is a no-op.
     Returns immediately; the render + robot dispatch runs in the background."""
     require_admin(request)
     manager.resolve_vectorization(payload)
     return SuccessResponse()
+
+
+@router.get("/admin/sessions", response_model=Admin.Sessions.Config)
+async def admin_get_sessions(request: Request) -> Admin.Sessions.Config:
+    """Return the current set of active session tokens (sorted)."""
+    require_admin(request)
+    return Admin.Sessions.Config(sessions=manager.get_active_sessions())
+
+
+@router.post("/admin/sessions", response_model=Admin.Sessions.Config)
+async def admin_set_sessions(
+    request: Request, payload: Admin.Sessions.Config
+) -> Admin.Sessions.Config:
+    """Replace the active session set with ``payload.sessions`` (send the complete
+    desired list — this is a wholesale replace, not a merge). Persisted to disk and
+    effective immediately for new submissions. Returns the stored set (sorted)."""
+    require_admin(request)
+    manager.set_active_sessions(payload.sessions)
+    return Admin.Sessions.Config(sessions=manager.get_active_sessions())

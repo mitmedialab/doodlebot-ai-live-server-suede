@@ -125,6 +125,11 @@ v2.HEARTBEAT = 0.5
 
 TOKEN = os.environ["ADMIN_TOKEN"]
 
+# All sketch submissions in these tests ride this session; activate it up front so
+# the session gate accepts them (the gate is exercised directly in its own tests).
+SESSION = "test-session-abc"
+v2.manager.set_active_sessions([SESSION])
+
 
 # --- OpenAI combine stub ---------------------------------------------------
 
@@ -268,10 +273,17 @@ def _new_client(client: TestClient) -> str:
     return resp.json()["client"]
 
 
-def _submit(client: TestClient, client_id: str, seed: int) -> str:
-    resp = client.post("/sketch", json={"client": client_id, "sketch": _sketch_data_url(seed)})
+def _submit(
+    client: TestClient, client_id: str, seed: int, session: str = SESSION
+) -> str:
+    resp = client.post(
+        "/sketch",
+        json={"client": client_id, "session": session, "sketch": _sketch_data_url(seed)},
+    )
     assert resp.status_code == 200, resp.text
-    return resp.json()["sketch"]
+    body = resp.json()
+    assert body.get("status") is None, f"unexpected rejection: {body}"
+    return body["sketch"]
 
 
 def _resolve_sketch(client: TestClient, sketch_id: str, status: str) -> None:
@@ -593,6 +605,78 @@ def test_sketch_payload_carries_submitter_stats(client: TestClient) -> None:
     }
 
 
+def test_inactive_session_rejected(client: TestClient) -> None:
+    client_id = _new_client(client)
+    data_url = _sketch_data_url(seed=91)
+
+    for bad in ("not-a-real-session", ""):
+        resp = client.post(
+            "/sketch", json={"client": client_id, "session": bad, "sketch": data_url}
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "inactive session", body
+        # It still echoes the content id, but nothing was created server-side...
+        rejected_id = body["sketch"]
+        assert rejected_id not in v2.manager.sketches
+        assert client_id not in v2.manager.clients  # no client record either
+        assert rejected_id not in v2.manager.pending_sketches
+        # ...and no blob was uploaded for it.
+        assert FakeStorage.resource_key(rejected_id, "image/png") not in _FAKE_STORAGE.blobs
+
+    # The admin queue never heard about the rejected submissions.
+    assert not [e for e in _drain_admin_backlog() if e.get("sketch_id") == rejected_id]
+
+    # The same content under the active session sails through into the pipeline.
+    accepted = _submit(client, client_id, seed=91)  # SESSION is active
+    assert accepted in v2.manager.sketches
+    assert accepted in v2.manager.pending_sketches
+
+
+def test_admin_configures_sessions(client: TestClient) -> None:
+    # The endpoints are admin-gated.
+    assert client.get("/admin/sessions").status_code == 401
+    assert client.post("/admin/sessions", json={"sessions": ["x"]}).status_code == 401
+
+    # GET reflects the currently-active set (the bootstrap session).
+    current = client.get("/admin/sessions", params={"token": TOKEN})
+    assert current.status_code == 200
+    assert SESSION in current.json()["sessions"]
+
+    try:
+        # POST replaces the set wholesale (and drops blanks); GET confirms it.
+        replace = client.post(
+            "/admin/sessions",
+            params={"token": TOKEN},
+            json={"sessions": ["room-1", "room-2", ""]},
+        )
+        assert replace.status_code == 200, replace.text
+        assert replace.json()["sessions"] == ["room-1", "room-2"]  # sorted, blank dropped
+        assert client.get("/admin/sessions", params={"token": TOKEN}).json()["sessions"] == [
+            "room-1",
+            "room-2",
+        ]
+
+        # A newly-active session is accepted; the old bootstrap one now rejects.
+        who = _new_client(client)
+        good = client.post(
+            "/sketch", json={"client": who, "session": "room-1", "sketch": _sketch_data_url(92)}
+        )
+        assert good.json().get("status") is None
+        assert good.json()["sketch"] in v2.manager.sketches
+
+        stale = client.post(
+            "/sketch", json={"client": who, "session": SESSION, "sketch": _sketch_data_url(93)}
+        )
+        assert stale.json()["status"] == "inactive session"
+
+        # Config is durable: a freshly-constructed manager reloads it from disk.
+        assert v2.Manager().get_active_sessions() == ["room-1", "room-2"]
+    finally:
+        # Restore the shared bootstrap session for any other scenario.
+        v2.manager.set_active_sessions([SESSION])
+
+
 # --- pytest fixture / standalone runner ------------------------------------
 
 try:
@@ -619,6 +703,8 @@ def _run_standalone() -> int:
         test_combine_concurrency_is_bounded,
         test_combine_retries_on_rate_limit,
         test_sketch_payload_carries_submitter_stats,
+        test_inactive_session_rejected,
+        test_admin_configures_sessions,
     ]
     failures = 0
     with TestClient(app) as test_client:
