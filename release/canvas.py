@@ -91,13 +91,17 @@ Stroke = list[Point]  # a contiguous pen-down polyline, in drawing-local mm
 def commands_to_strokes(
     commands: Sequence[Command], arc_step_deg: float = 6.0
 ) -> list[Stroke]:
-    """Turtle-integrate drawing commands into pen-down polylines (local mm frame).
+    strokes, _ = commands_to_strokes_with_pose(commands, arc_step_deg)
+    return strokes
 
-    Conventions follow the vectorizer (``arc_line_vectorization_suede.commands``):
-    heading 0 points along +x, angles are degrees, ``line`` carries an explicit
-    ``penDown`` flag (pen-up lines are travel moves), ``spin`` rotates in place,
-    and ``arc`` is always a pen-down stroke flattened into short segments.
-    """
+
+def commands_to_strokes_with_pose(
+    commands: Sequence[Command], arc_step_deg: float = 6.0
+) -> tuple[list[Stroke], Pose]:
+    """Same turtle-integration as commands_to_strokes, but also returns the
+    final local pose (x, y, headingDegrees). Uses the exact same math as the
+    stroke generation (including chord-flattened arcs), so the returned pose
+    is guaranteed consistent with the last point of the last stroke."""
 
     x, y, heading = 0.0, 0.0, 0.0
     strokes: list[Stroke] = []
@@ -123,10 +127,10 @@ def commands_to_strokes(
             if cmd.penDown:
                 extend(nx, ny)
             else:
-                flush()  # travel move ends the current stroke
+                flush()
             x, y = nx, ny
         elif cmd.kind == "spin":
-            heading += cmd.degrees  # in-place rotation; does not move or break a stroke
+            heading += cmd.degrees
         elif cmd.kind == "arc":
             steps = max(1, int(math.ceil(abs(cmd.degrees) / arc_step_deg)))
             dtheta = cmd.degrees / steps
@@ -142,7 +146,7 @@ def commands_to_strokes(
             raise ValueError(f"Unknown drawing command kind: {cmd.kind!r}")
 
     flush()
-    return strokes
+    return strokes, Pose(x=x, y=y, headingDegrees=heading)
 
 
 def rotate_strokes(strokes: Sequence[Stroke], degrees: float) -> list[Stroke]:

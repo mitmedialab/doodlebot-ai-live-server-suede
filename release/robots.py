@@ -335,6 +335,7 @@ def _span(strokes: list) -> float:
 class _StagedJob:
     job: DrawingJob
     navigate_to: Pose  # resolved start pose (first ink point + approach heading)
+    navigate_from: Pose
     commands: list[DrawingCommand]  # the drawing with its lead-in stripped off
 
 
@@ -795,6 +796,10 @@ class _Coordinator:
                 region.commit(placement)
                 print(scaled_commands)
 
+                _, navigateFrom = canvas_engine.commands_to_strokes_with_pose(
+                    scaled_commands
+                )
+
                 staged_angle = qj.heading0 + placement.angle_deg
                 bot.staged = _StagedJob(
                     job=qj.job,
@@ -802,6 +807,11 @@ class _Coordinator:
                         x=placement.anchor_x,
                         y=placement.anchor_y,
                         headingDegrees=staged_angle,
+                    ),
+                    navigate_from=Pose(
+                        x=navigateFrom.x,
+                        y=navigateFrom.y,
+                        headingDegrees=navigateFrom.headingDegrees,
                     ),
                     commands=scaled_commands,
                 )
