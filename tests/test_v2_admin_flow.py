@@ -247,6 +247,42 @@ def _drain_admin_backlog() -> list[dict]:
     return out
 
 
+def _drain_all_feed() -> list[dict]:
+    """Snapshot what a freshly-connecting gallery client is replayed on /events/all.
+
+    Exercises Manager.subscribe_all (the exact history the /events/all route
+    pre-loads) and drains it synchronously — same rationale as _drain_admin_backlog:
+    this TestClient build deadlocks reading a streaming StreamingResponse, so we
+    read the SSE *content* off the queue instead. Call at a quiescent point so no
+    background _emit races the drain (asyncio.Queue isn't thread-safe)."""
+    import asyncio
+
+    queue = v2.manager.subscribe_all()
+    out: list[dict] = []
+    try:
+        while True:
+            try:
+                out.append(json.loads(queue.get_nowait()))
+            except asyncio.QueueEmpty:
+                break
+    finally:
+        v2.manager.unsubscribe_all(queue)
+    return out
+
+
+def _drain_queue(queue) -> list[dict]:  # noqa: ANN001
+    """Drain whatever a live subscriber's queue holds right now, decoded."""
+    import asyncio
+
+    out: list[dict] = []
+    while True:
+        try:
+            out.append(json.loads(queue.get_nowait()))
+        except asyncio.QueueEmpty:
+            break
+    return out
+
+
 def _arm_robot(name: str, color: str) -> None:
     """Give ``name`` sole ownership of a big empty region and check it in ready,
     so the next enqueued drawing stages onto it immediately."""
@@ -685,6 +721,77 @@ def test_admin_configures_sessions(client: TestClient) -> None:
         v2.manager.set_active_sessions([SESSION])
 
 
+def test_gallery_feed_mirrors_all_clients(client: TestClient) -> None:
+    # Two sketches from two distinct clients; reject one so a status event is
+    # emitted too. The public feed carries every one of these payloads.
+    a = _new_client(client)
+    sid_a = _submit(client, a, seed=201)
+    b = _new_client(client)
+    sid_b = _submit(client, b, seed=202)
+    _resolve_sketch(client, sid_b, "innapropriate")  # terminal: no grouping/pipeline
+
+    # A fresh /events/all connection is replayed the full history. For each sketch,
+    # the payloads on the public feed are exactly its own events (same encoding as
+    # the per-client feed) — no client identity is added, whatever's on
+    # ClientSSEPayload is enough. Filtering by sketch id is robust to events from
+    # other clients (and earlier scenarios) sharing the one global feed.
+    feed = _drain_all_feed()
+    for sid in (sid_a, sid_b):
+        mine = [e for e in feed if e["sketch"] == sid]
+        assert mine == _events(sid), sid
+    assert {"sketch": sid_a, "session": SESSION} in feed
+    assert {"sketch": sid_b, "session": SESSION, "status": "innapropriate"} in feed
+
+    # Live fan-out: a subscriber connected *before* an emit receives it. Drain the
+    # replayed backlog first, then a new submission's creation event should arrive.
+    live = v2.manager.subscribe_all()
+    try:
+        _drain_queue(live)  # discard the history snapshot
+        sid_c = _submit(client, _new_client(client), seed=203)
+        assert {"sketch": sid_c, "session": SESSION} in _drain_queue(live)
+    finally:
+        v2.manager.unsubscribe_all(live)
+
+
+def test_gallery_history_clear_is_admin_gated_and_durable(client: TestClient) -> None:
+    sid_pre = _submit(client, _new_client(client), seed=211)  # history before the clear
+    assert len(_drain_all_feed()) > 0
+
+    # The clear endpoint is admin-gated, like /static/bust.
+    assert client.get("/events/all/clear").status_code == 401
+    assert client.post("/events/all/clear").status_code == 401
+
+    # A live subscriber connected before the clear keeps streaming afterwards —
+    # only the replay handed to *future* connections is emptied.
+    live = v2.manager.subscribe_all()
+    sid_post = None
+    try:
+        _drain_queue(live)
+
+        # Clearing over GET works (browser-navigable) and reports what it dropped.
+        resp = client.get("/events/all/clear", params={"token": TOKEN})
+        assert resp.status_code == 200, resp.text
+        assert "Cleared" in resp.text
+
+        # A fresh connection now replays nothing...
+        assert _drain_all_feed() == []
+        # ...but the still-connected subscriber receives new live events.
+        sid_post = _submit(client, _new_client(client), seed=212)
+        assert {"sketch": sid_post, "session": SESSION} in _drain_queue(live)
+    finally:
+        v2.manager.unsubscribe_all(live)
+
+    # Durable: a freshly-constructed manager honors the cutoff. The pre-clear
+    # sketch is suppressed from the gallery backlog; the post-clear one re-seeds.
+    # Both per-sketch metas stay on disk (so per-client replay is unaffected) —
+    # only the gallery history respects the cutoff.
+    reloaded = v2.Manager()
+    replayed_ids = {json.loads(frame)["sketch"] for frame in reloaded._all_history}
+    assert sid_pre not in replayed_ids
+    assert sid_post in replayed_ids
+    assert sid_pre in reloaded.sketches and sid_post in reloaded.sketches
+
+
 # --- pytest fixture / standalone runner ------------------------------------
 
 try:
@@ -713,6 +820,8 @@ def _run_standalone() -> int:
         test_sketch_payload_carries_submitter_stats,
         test_inactive_session_rejected,
         test_admin_configures_sessions,
+        test_gallery_feed_mirrors_all_clients,
+        test_gallery_history_clear_is_admin_gated_and_durable,
     ]
     failures = 0
     with TestClient(app) as test_client:
