@@ -792,6 +792,66 @@ def test_gallery_history_clear_is_admin_gated_and_durable(client: TestClient) ->
     assert sid_pre in reloaded.sketches and sid_post in reloaded.sketches
 
 
+def test_admin_test_draw_pins_shape_to_named_robot(client: TestClient) -> None:
+    coordinator.clear_queue()  # isolate from any jobs earlier scenarios left queued
+
+    # Admin-gated like the other admin routes.
+    assert client.post("/admin/test-draw", json={"shape": "square"}).status_code == 401
+
+    # A named bot that isn't ready (never checked in) fails fast — nothing is
+    # enqueued, and crucially it is NOT rerouted to some other ready bot.
+    _arm_robot("bystander", "#0f0")  # a ready bot that must NOT receive the job
+    resp = client.post(
+        "/admin/test-draw",
+        params={"token": TOKEN},
+        json={"shape": "line", "robot": "ghost-bot"},
+    )
+    assert resp.status_code == 409, resp.text
+    assert coordinator.snapshot().queuedJobs == 0  # nothing left waiting either
+
+    # Every shape draws end-to-end on exactly the bot it's pinned to. Each shape
+    # gets its own bot (arming re-owns the canvas), drawn while that bot owns it.
+    for i, shape in enumerate(("line", "square", "triangle", "sine_wave")):
+        bot = f"probe-{i}"
+        _arm_robot(bot, "#0af")
+        resp = client.post(
+            "/admin/test-draw",
+            params={"token": TOKEN},
+            json={"shape": shape, "robot": bot},
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["shape"] == shape
+        assert body["robot"] == bot, body
+        # The coordinator staged the job on that same bot, nowhere else.
+        assert coordinator.assigned_robot(body["job_id"]) == bot
+
+    # A bot that's already staged a drawing is no longer "ready": a further pinned
+    # request 409s rather than queuing behind the in-flight job or hijacking a peer.
+    assert (
+        client.post(
+            "/admin/test-draw",
+            params={"token": TOKEN},
+            json={"shape": "line", "robot": "probe-3"},
+        ).status_code
+        == 409
+    )
+
+
+def test_admin_test_draw_without_robot_uses_normal_selection(client: TestClient) -> None:
+    coordinator.clear_queue()
+    # Only one bot has a region on the (re-owned) canvas, so normal selection must
+    # land the shape on it — no robot pinned in the request.
+    _arm_robot("solo-bot", "#f50")
+    resp = client.post(
+        "/admin/test-draw", params={"token": TOKEN}, json={"shape": "triangle"}
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["robot"] == "solo-bot"
+    assert coordinator.assigned_robot(body["job_id"]) == "solo-bot"
+
+
 # --- pytest fixture / standalone runner ------------------------------------
 
 try:
@@ -822,6 +882,8 @@ def _run_standalone() -> int:
         test_admin_configures_sessions,
         test_gallery_feed_mirrors_all_clients,
         test_gallery_history_clear_is_admin_gated_and_durable,
+        test_admin_test_draw_pins_shape_to_named_robot,
+        test_admin_test_draw_without_robot_uses_normal_selection,
     ]
     failures = 0
     with TestClient(app) as test_client:
