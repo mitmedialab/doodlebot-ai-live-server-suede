@@ -191,7 +191,7 @@ optimize). It returns two command lists — `low_geometry` (consolidated) and
 (`line`/`spin`/`arc`, discriminated union) are exactly what `robots.py` consumes,
 closing the loop from pixels to pen strokes.
 
-The extension isn't on PyPI: `requirements.txt` pins each platform's prebuilt
+The extension isn't on PyPI: `pyproject.toml` pins each platform's prebuilt
 wheel (Linux x86_64/aarch64, macOS) by release URL + sha256, so the Docker build
 needs no Rust toolchain. To upgrade, swap the version + hashes for a newer
 [release](https://github.com/pmalacho-mit/suede.doodlebot-vectorize/releases).

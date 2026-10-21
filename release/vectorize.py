@@ -2,7 +2,7 @@ from .svg import DrawingCommand
 
 # Rust port of the arc/line vectorizer (formerly the vendored
 # arc_line_vectorization_suede package). Prebuilt wheels are pinned per
-# platform in requirements.txt; see
+# platform in pyproject.toml; see
 # https://github.com/pmalacho-mit/suede.doodlebot-vectorize
 import arcline_vectorize
 
