@@ -1,1 +1,59 @@
-../.suede/devcontainers-suede/python-docker.json
+{
+  "customizations": {
+    "desolate": {
+      "allowPrivileged": true,
+      "shadowImages": ["python:3.11-slim"],
+      "ports": [5173]
+    },
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "detachhead.basedpyright",
+        "esbenp.prettier-vscode",
+        "ms-azuretools.vscode-containers",
+        "ms-python.python",
+        "ms-python.black-formatter",
+        "svelte.svelte-vscode"
+      ],
+      "settings": {
+        "[javascript]": {
+          "editor.defaultFormatter": "esbenp.prettier-vscode",
+          "editor.formatOnSave": true
+        },
+        "[markdown]": {
+          "editor.defaultFormatter": null
+        },
+        "[python]": {
+          "editor.defaultFormatter": "ms-python.black-formatter",
+          "editor.formatOnSave": true
+        },
+        "[svelte]": {
+          "editor.defaultFormatter": "svelte.svelte-vscode"
+        },
+        "[typescript]": {
+          "editor.defaultFormatter": "esbenp.prettier-vscode",
+          "editor.formatOnSave": true
+        },
+        "editor.formatOnSave": true,
+        "editor.tabSize": 2,
+        "python.defaultInterpreterPath": "backend/.venv/bin/python",
+        "python.terminal.activateEnvInCurrentTerminal": true,
+        "files.autoSave": "off",
+        "svelte.enable-ts-plugin": true,
+        "svelte.plugin.typescript.enable": true,
+        "svelte.ask-to-enable-ts-plugin": false
+      }
+    }
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:4": {},
+    "ghcr.io/devcontainers/features/python:latest": {
+      "version": "3.12"
+    },
+    "ghcr.io/guiyomh/features/vim:0": {},
+    "ghcr.io/pmalacho-mit/devcontainer-features/git-subrepo:latest": {},
+    "ghcr.io/robbert229/devcontainer-features/postgresql-client:1": {}
+  },
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "postCreateCommand": "bash -c 'if [ -f \"./install.sh\" ]; then echo \"Found install.sh, executing...\" && bash ./install.sh && echo \"install.sh completed successfully\" || exit 1; else echo \"No install.sh found at project root, skipping\"; fi' && git config core.editor '/usr/bin/vim' && git config pull.rebase false && sudo curl -fsSL https://gist.githubusercontent.com/pmalacho-mit/d64caa8e16b0b0fdd5e58cc37a0ce242/raw/8f0f620d4a65f6f3d930ea14e7c2fdf382ef1bf1/codeblockify.sh -o /usr/local/bin/codeblockify"
+}

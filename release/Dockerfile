@@ -22,8 +22,8 @@ COPY ./.suede/.dependencies/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the application source into the package directory. Copy the whole tree
-# (not just *.py) so subpackages like arc_line_vectorization_suede/ come along;
-# .dockerignore keeps runtime data (pending/sketches/combined/presets.json) out.
+# (not just *.py) so any subpackages come along; .dockerignore keeps runtime
+# data (pending/sketches/combined/presets.json) out.
 COPY . ./server/
 
 # Runtime data/static paths in the code are relative to the CWD

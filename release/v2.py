@@ -68,10 +68,7 @@ from fastapi.responses import RedirectResponse, Response, StreamingResponse
 from PIL import Image
 from pydantic import BaseModel
 
-from .arc_line_vectorization_suede.visualize import (
-    commands_to_svg,
-    DrawingCommand as VectorDrawingCommand,
-)
+from .svg import commands_to_svg, DrawingCommand as VectorDrawingCommand
 from .combine import Combine
 from .common import SuccessResponse, require_admin
 from .robots import (
