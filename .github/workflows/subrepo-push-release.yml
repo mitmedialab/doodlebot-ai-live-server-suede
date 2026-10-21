@@ -1,20 +1,25 @@
 name: subrepo-push-release
 #
-# Lives on `main`. Fires when a library author pushes to main and touches
-# release/. Syncs ./release out to the `release` branch. The subrepo sync itself
-# (pull-then-push, then propagate the .gitrepo pointer bump back to main) lives
-# in the hosted, unit-tested script scripts/actions/push-release.sh.
+# Lives on `main`. Fires when a change under release/ lands. Everything it does
+# is in .suede/core/push-release.sh: refresh the dependency records, refuse to
+# publish a dishonest pointer (a diverged release dependency, or a declared
+# dependency that is not in place), then sync ./release out to the `release`
+# branch.
+#
+# This file only wires up credentials and the two third-party tools. Keeping
+# the logic in a script is what makes it testable without a runner.
 on:
   push:
     branches: [main]
     paths:
       - "release/**"
 
-env:
-  # Base URL for the hosted suede scripts this workflow curls as $SUEDE_SCRIPTS/<path>.
-  # Point it at your canonical host/ref; every referenced script must be reachable there.
-  # (git-subrepo is installed separately on purpose — it's a third-party tool, not a suede script.)
-  SUEDE_SCRIPTS: https://raw.githubusercontent.com/pmalacho-mit/suede/refs/heads/main/scripts
+permissions:
+  contents: write
+
+concurrency:
+  group: suede-push-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   push:
@@ -25,36 +30,19 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set up Git user
+      - name: Configure git
         run: |
           git config --global user.email "action@github.com"
           git config --global user.name "GitHub Action"
-
-      - name: Configure Git credentials
-        run: |
           git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/".insteadOf "https://github.com/"
 
-      - name: Populate dependency artifacts
-        shell: bash
-        run: |
-          bash -c "$(curl -fsSL "$SUEDE_SCRIPTS/populate/dependencies.sh")"
-
-      - name: Commit dependency changes
-        run: |
-          if [ -n "$(git status --porcelain release/.suede/.dependencies/)" ]; then
-            git add release/.suede/.dependencies/
-            git commit -m "chore(suede): update dependency artifacts"
-          else
-            echo "No dependency changes to commit"
-          fi
-
+      # A third-party tool, not a suede script, so it is installed here rather
+      # than vendored.
       - name: Install git-subrepo
         run: |
-          git clone https://github.com/ingydotnet/git-subrepo ~/.git-subrepo
-          echo "$HOME/.git-subrepo/lib" >> "$GITHUB_PATH"   # on PATH for all later steps, incl. the script's child shell
+          git clone --quiet --branch 0.4.9 https://github.com/ingydotnet/git-subrepo "$HOME/.git-subrepo"
+          echo "$HOME/.git-subrepo/lib" >> "$GITHUB_PATH"
 
-      - name: Check git-subrepo installation
-        run: git subrepo --version
-
-      - name: Sync ./release out to the release branch
-        run: bash -c "$(curl -fsSL "$SUEDE_SCRIPTS/actions/push-release.sh")"
+      # --https: a runner has no SSH key, so the SSH attempt would only cost a
+      # timeout per dependency before the fallback.
+      - run: bash .suede/core/push-release.sh --https
