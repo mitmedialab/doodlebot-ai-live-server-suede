@@ -852,6 +852,122 @@ def test_admin_test_draw_without_robot_uses_normal_selection(client: TestClient)
     assert coordinator.assigned_robot(body["job_id"]) == "solo-bot"
 
 
+def _with_sessions(*extra: str):
+    """Activate ``extra`` sessions alongside the shared bootstrap one."""
+    v2.manager.set_active_sessions([SESSION, *extra])
+
+
+def test_stale_pair_topped_up_from_same_session(client: TestClient) -> None:
+    room = "fill-room"
+    _with_sessions(room)
+    saved = v2.TRIO_FILL_AFTER
+    v2.TRIO_FILL_AFTER = 0.5
+    try:
+        # An earlier trio in this session supplies the sketches that may be borrowed.
+        earlier = [_submit(client, _new_client(client), s, session=room) for s in (31, 32, 33)]
+        for sid in earlier:
+            _approve_sketch(client, sid)
+        assert _wait_until(lambda: _pending_vec_for(earlier))
+        earlier_events = {sid: len(_events(sid)) for sid in earlier}
+        earlier_states = {sid: v2.manager.sketches[sid].state for sid in earlier}
+
+        # A new pair forms, then nobody else turns up.
+        pair = [_submit(client, _new_client(client), s, session=room) for s in (34, 35)]
+        for sid in pair:
+            _approve_sketch(client, sid)
+        assert all(v2.manager.sketches[s].state == "approved" for s in pair)
+
+        # After TRIO_FILL_AFTER the pair is topped up with one earlier sketch from
+        # *this* session (the bootstrap session has approved sketches too — none
+        # may be borrowed) and starts combining.
+        assert _wait_until(lambda: all(v2.manager.sketches[s].state == "combining" for s in pair))
+        companions = [
+            next(e["companions"] for e in reversed(_events(s)) if "companions" in e) for s in pair
+        ]
+        filler = (set(companions[0]) - set(pair)).pop()
+        assert filler in earlier, "filler must come from the same session"
+        assert set(companions[0]) == {pair[1], filler}
+        assert set(companions[1]) == {pair[0], filler}
+
+        pending = _wait_until(lambda: _pending_vec_for(pair + [filler]))
+        assert pending is not None
+        assert pending.member_ids == pair
+
+        # The admin sees all three source sketches; only the pair is advanced.
+        vec = next(
+            e for e in _drain_admin_backlog()
+            if e.get("type") == "vectorization" and e["vectorization_id"] == pending.id
+        )
+        assert set(vec["source_trio"]) == set(pair) | {filler}
+        _arm_robot("bot-fill", "#445566")
+        resp = client.post(
+            "/admin/vectorization",
+            params={"token": TOKEN},
+            json={"vectorization_id": pending.id, "commands": vec["command_options"][0]},
+        )
+        assert resp.status_code == 200, resp.text
+        assert _wait_until(lambda: all(v2.manager.sketches[s].state == "complete" for s in pair))
+
+        # The borrowed sketch's owner never heard a thing.
+        assert {sid: len(_events(sid)) for sid in earlier} == earlier_events
+        assert {sid: v2.manager.sketches[sid].state for sid in earlier} == earlier_states
+    finally:
+        v2.TRIO_FILL_AFTER = saved
+        v2.manager.set_active_sessions([SESSION])
+
+
+def test_stale_pair_waits_when_session_has_nothing_to_borrow(client: TestClient) -> None:
+    room = "empty-room"
+    _with_sessions(room)
+    saved = v2.TRIO_FILL_AFTER
+    v2.TRIO_FILL_AFTER = 0.2
+    try:
+        pair = [_submit(client, _new_client(client), s, session=room) for s in (51, 52)]
+        for sid in pair:
+            _approve_sketch(client, sid)
+        time.sleep(1.0)
+        assert all(v2.manager.sketches[s].state == "approved" for s in pair)
+        assert _pending_vec_for(pair) is None
+
+        # A real third approval still completes the trio as usual.
+        third = _submit(client, _new_client(client), 53, session=room)
+        _approve_sketch(client, third)
+        assert _wait_until(lambda: _pending_vec_for(pair + [third]))
+    finally:
+        v2.TRIO_FILL_AFTER = saved
+        v2.manager.set_active_sessions([SESSION])
+
+
+def test_auto_session_runs_without_curator(client: TestClient) -> None:
+    room = f"{v2.AUTO_SESSION_PREFIX}-room"
+    _with_sessions(room)
+    try:
+        _arm_robot("bot-auto", "#778899")
+        trio = [_submit(client, _new_client(client), s, session=room) for s in (81, 82, 83)]
+
+        # Approved on submission: no admin verdict needed, nothing on the admin feed.
+        for sid in trio:
+            assert sid not in v2.manager.pending_sketches
+            assert any(e.get("status") == "approved" for e in _events(sid))
+        assert not [e for e in _drain_admin_backlog() if e.get("sketch_id") in trio]
+
+        # The vectorization is chosen automatically and the drawing dispatched.
+        assert _wait_until(lambda: all(v2.manager.sketches[s].state == "complete" for s in trio))
+        assert _pending_vec_for(trio) is None
+        vec_id = next(e["vectorization"] for e in _events(trio[0]) if "vectorization" in e)
+        for sid in trio:
+            assert _events(sid)[-1].get("robot") == "bot-auto"
+
+        # It's the option with the fewest commands (the stub alternates between two
+        # drawings, so the two options are the vectorizations of those).
+        options = [v2._vectorize_for_robot(base64.b64decode(v)) for v in _STUB_VARIANTS]
+        assert len(options[0]) != len(options[1]), "stub variants should differ in size"
+        stored = _FAKE_STORAGE.blobs[FakeStorage.resource_key(vec_id, "image/svg+xml")]
+        assert stored.decode("utf-8") == v2._render_commands_svg(min(options, key=len))
+    finally:
+        v2.manager.set_active_sessions([SESSION])
+
+
 # --- pytest fixture / standalone runner ------------------------------------
 
 try:
@@ -884,6 +1000,9 @@ def _run_standalone() -> int:
         test_gallery_history_clear_is_admin_gated_and_durable,
         test_admin_test_draw_pins_shape_to_named_robot,
         test_admin_test_draw_without_robot_uses_normal_selection,
+        test_stale_pair_topped_up_from_same_session,
+        test_stale_pair_waits_when_session_has_nothing_to_borrow,
+        test_auto_session_runs_without_curator,
     ]
     failures = 0
     with TestClient(app) as test_client:
