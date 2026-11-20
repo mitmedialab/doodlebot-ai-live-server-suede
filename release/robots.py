@@ -61,8 +61,7 @@ from .canvas import (
 from .common import require_admin
 
 import numpy as np
-from shapely.geometry import LineString, Point as ShapelyPoint
-from shapely.ops import unary_union
+import shapely
 
 router = APIRouter()
 
@@ -387,6 +386,8 @@ class _StagedJob:
     navigate_to: Pose  # resolved start pose (first ink point + approach heading)
     navigate_from: Pose
     commands: list[DrawingCommand]  # the drawing with its lead-in stripped off
+    strokes: list  # the ink in world mm, exactly as the bot will draw it
+    exit_pose: Pose  # where the bot goes afterwards; the same pose the record keeps
 
 
 @dataclass
@@ -450,19 +451,30 @@ def compute_exit_pose(
     drawing_weight: float = 2.0,
     debug_plot: bool = False,
 ) -> Pose:
+    """Where the robot should drive once it has finished drawing ``strokes``.
 
-    # Original drawing (used for distance scoring)
-    drawing_lines = unary_union(
-        [LineString(stroke) for stroke in strokes if len(stroke) >= 2]
-    )
+    Candidates lie along each marker's inward-facing direction, every
+    ``distance_step`` mm from ``min_marker_distance`` to ``max_marker_distance``
+    out from it. A candidate is kept if it lies inside ``allowed_region`` at least
+    ``boundary`` mm from its edges, and at least ``robot_radius`` mm from the ink.
+    The kept candidate with the lowest weighted score — distance to its marker,
+    to the region's centre, and (doubly weighted) to the ink — wins, facing back
+    toward its marker. Ties go to the earlier candidate (markers in order, nearer
+    distances first). If nothing survives, the region's centre, facing the nearest
+    marker.
 
-    # Buffered drawing (used for collision checking)
-    drawing = drawing_lines.buffer(robot_radius)
+    Every candidate is scored at once: one vectorized shapely distance query, then
+    numpy. "Not within ``robot_radius`` of the ink" is that same distance compared
+    with the radius. The previous version tested ``ink.buffer(robot_radius)
+    .contains`` instead: building that polygon dominated the cost, and because a
+    buffer rounds its caps and joins with chords it let through points up to
+    ~0.08mm too close, which this exact test does not.
 
-    best_pose = None
-    best_score = float("inf")
-
-    robot = np.array(strokes[-1][-1])
+    ``debug_plot`` is accepted for compatibility and ignored.
+    """
+    # The ink, for distances. No union needed: distance to a MultiLineString is
+    # the distance to its nearest member.
+    ink = shapely.MultiLineString([stroke for stroke in strokes if len(stroke) >= 2])
 
     if allowed_region is not None:
         region_center = np.array(
@@ -474,102 +486,67 @@ def compute_exit_pose(
     else:
         region_center = None
 
-    for marker in markers:
+    usable = [m for m in markers if m.yaw is not None]
+    if usable:
+        # Every candidate, marker-major: row k * len(steps) + j is marker k at
+        # steps[j] — the order ties are broken in.
+        steps = np.arange(
+            min_marker_distance, max_marker_distance + distance_step, distance_step
+        )
+        marker_pos = np.array([[m.x, m.y] for m in usable])
+        normals = np.array([[math.cos(m.yaw), math.sin(m.yaw)] for m in usable])
+        candidates = (
+            marker_pos[:, None, :] + steps[None, :, None] * normals[:, None, :]
+        ).reshape(-1, 2)
+        owner = np.repeat(np.arange(len(usable)), len(steps))
 
-        if marker.yaw is None:
-            continue
+        keep = np.ones(len(candidates), dtype=bool)
+        if allowed_region is not None:
+            x0, y0 = allowed_region.x, allowed_region.y
+            x1, y1 = x0 + allowed_region.width, y0 + allowed_region.height
+            cx, cy = candidates[:, 0], candidates[:, 1]
+            to_edge = np.minimum.reduce([cx - x0, x1 - cx, cy - y0, y1 - cy])
+            keep = (cx >= x0) & (cx <= x1) & (cy >= y0) & (cy <= y1) & (to_edge >= boundary)
 
-        marker_pos = np.array([marker.x, marker.y])
-
-        normal = np.array(
-            [
-                math.cos(marker.yaw),
-                math.sin(marker.yaw),
-            ]
+        candidates, owner = candidates[keep], owner[keep]
+        ink_distance = shapely.distance(ink, shapely.points(candidates))
+        clear = ink_distance >= robot_radius  # outside the ink's keep-out disc
+        candidates, owner, ink_distance = (
+            candidates[clear],
+            owner[clear],
+            ink_distance[clear],
         )
 
-        for d in np.arange(
-            min_marker_distance,
-            max_marker_distance + distance_step,
-            distance_step,
-        ):
-
-            candidate = marker_pos + d * normal
-            point = ShapelyPoint(*candidate)
-
-            # ----------------------------------------------------------
-            # Must be inside region
-            # ----------------------------------------------------------
-
-            if allowed_region is not None:
-
-                if not (
-                    allowed_region.x
-                    <= candidate[0]
-                    <= allowed_region.x + allowed_region.width
-                    and allowed_region.y
-                    <= candidate[1]
-                    <= allowed_region.y + allowed_region.height
-                ):
-                    continue
-
-                distance_to_boundary = min(
-                    candidate[0] - allowed_region.x,
-                    allowed_region.x + allowed_region.width - candidate[0],
-                    candidate[1] - allowed_region.y,
-                    allowed_region.y + allowed_region.height - candidate[1],
-                )
-
-                if distance_to_boundary < boundary:
-                    continue
-
-            # ----------------------------------------------------------
-            # Collision with buffered drawing
-            # ----------------------------------------------------------
-
-            if drawing.contains(point):
-                continue
-
-            # ----------------------------------------------------------
-            # Distances for scoring
-            # ----------------------------------------------------------
-
-            marker_distance = np.linalg.norm(candidate - marker_pos)
-
-            if region_center is not None:
-                center_distance = np.linalg.norm(candidate - region_center)
-            else:
-                center_distance = 0
-
-            # Distance to the actual drawing (not the buffered version)
-            drawing_distance = drawing_lines.distance(point)
-
+        if len(candidates):
+            # Summed in this order on purpose: scores tie exactly whenever two
+            # candidates sit on rays through the region's centre at the same ink
+            # distance, and the order of the additions decides how those round.
+            center_distance = (
+                np.linalg.norm(candidates - region_center, axis=1)
+                if region_center is not None
+                else 0.0
+            )
             score = (
-                marker_weight * marker_distance
+                marker_weight * np.linalg.norm(candidates - marker_pos[owner], axis=1)
                 + center_weight * center_distance
-                + drawing_weight * drawing_distance
+                + drawing_weight * ink_distance
+            )
+            best = int(np.argmin(score))  # first minimum, as ties go to the earlier
+            marker = usable[owner[best]]
+            x, y = float(candidates[best, 0]), float(candidates[best, 1])
+            return Pose(
+                x=x,
+                y=y,
+                headingDegrees=math.degrees(math.atan2(marker.y - y, marker.x - x)),
             )
 
-            if score < best_score:
-
-                heading = math.atan2(
-                    marker.y - candidate[1],
-                    marker.x - candidate[0],
-                )
-
-                best_score = score
-
-                best_pose = Pose(
-                    x=float(candidate[0]),
-                    y=float(candidate[1]),
-                    headingDegrees=math.degrees(heading),
-                )
-    if best_pose is not None:
-        return best_pose
-
-    print(
-        f"Unable to compute best pose for region: {allowed_region.id}, robot: {allowed_region.robot}. Computing default."
+    where = (
+        f"region: {allowed_region.id}, robot: {allowed_region.robot}"
+        if allowed_region is not None
+        else "no region"
     )
+    print(f"Unable to compute best pose for {where}. Computing default.")
+    robot = np.array(strokes[-1][-1])
 
     # ------------------------------------------------------------------
     # Fallback: no candidate survived the region / collision / scoring
@@ -774,20 +751,14 @@ class _Coordinator:
                 record.staged = None
                 record.status = "drawing"
                 record.ready_since = None
-                strokes = self.replay_to_world(
-                    staged.commands,
-                    staged.navigate_to.x,
-                    staged.navigate_to.y,
-                    staged.navigate_to.headingDegrees,
-                )
-                exit_pose = compute_exit_pose(strokes, canvas.markers, region)
-                self.drawingDictionary[req.name] = strokes
+                # Both were worked out when the job was staged (``_assign_locked``).
+                self.drawingDictionary[req.name] = staged.strokes
                 return CheckIn.Draw(
                     jobId=staged.job.jobId,
                     navigateTo=staged.navigate_to,
                     navigateFrom=staged.navigate_from,
                     commands=staged.commands,
-                    exitPose=exit_pose,
+                    exitPose=staged.exit_pose,
                 )
 
             return CheckIn.Wait()
@@ -1001,6 +972,16 @@ class _Coordinator:
                     ),
                 )
 
+                drawing_strokes = self.replay_to_world(
+                    commands=scaled_commands,
+                    start_x=placement.anchor_x,
+                    start_y=placement.anchor_y,
+                    heading_deg=staged_angle,
+                )
+                # Computed once, here: the record below and the bot (on its next
+                # check-in) get this same pose.
+                exit_pose = compute_exit_pose(drawing_strokes, canvas.markers, region)
+
                 bot.staged = _StagedJob(
                     job=qj.job,
                     navigate_to=Pose(
@@ -1014,14 +995,9 @@ class _Coordinator:
                         headingDegrees=navigateFrom.headingDegrees,
                     ),
                     commands=scaled_commands,
+                    strokes=drawing_strokes,
+                    exit_pose=exit_pose,
                 )
-                drawing_strokes = self.replay_to_world(
-                    commands=scaled_commands,
-                    start_x=placement.anchor_x,
-                    start_y=placement.anchor_y,
-                    heading_deg=staged_angle,
-                )
-                exit_pose = compute_exit_pose(drawing_strokes, canvas.markers, region)
 
                 self.add_drawing(
                     canvas.id,
