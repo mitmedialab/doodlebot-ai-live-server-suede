@@ -1,6 +1,7 @@
 """Focused unit checks for two coordinator behaviors (no visuals):
 
-* ``clear_drawings`` frees the occupancy grid, not just the record (bug #1), and
+* ``clear_drawings`` frees the space, not just the record (bug #1),
+* drawings loaded from a saved record are reserved where their ink is, and
 * a placed drawing is uniformly scaled to the canvas ``targetFootprintMm`` —
   longest side hits the target, aspect ratio preserved (feature #3).
 
@@ -67,16 +68,38 @@ def _bbox_span(strokes) -> tuple[float, float]:
 
 def test_clear_drawings_frees_occupancy():
     coord = _Coordinator([_canvas(target_mm=300.0, w=1000.0, h=1000.0)], seed=0)
-    region = coord._store.region_for_robot("bot")
-    assert region is not None
 
     _place_one(coord, _a_vectorization())
-    assert region.free_fraction < 1.0, "placing should consume occupancy"
+    assert coord.free_fractions("c")["r"] < 1.0, "placing should consume occupancy"
 
     cleared = coord.clear_drawings("c")
     assert cleared == 1
     assert coord._drawings["c"] == []
-    assert region.free_fraction == 1.0, "clear_drawings must reset the occupancy grid"
+    assert coord.free_fractions("c")["r"] == 1.0, "clear_drawings must free the space"
+
+
+def test_inserted_drawings_are_reserved_where_their_ink_is():
+    """Drawings loaded with ``set_canvas`` (e.g. after a restart) block exactly the
+    cells under their ink — not cells shifted off it.
+
+    The old ``Region.add_drawings`` placed each restored mask ``pad`` cells down
+    and right of its ink, leaving the ink's top-left edge unprotected.
+    """
+    coord = _Coordinator([_canvas(target_mm=300.0, w=1000.0, h=1000.0)], seed=0)
+    placed = _place_one(coord, _a_vectorization())
+
+    # A fresh coordinator that only learns about the drawing from the record.
+    restored = _Coordinator([_canvas(target_mm=300.0, w=1000.0, h=1000.0)], seed=0)
+    restored.insert_drawings("c", [placed])
+    reserved = restored.occupancy("c", "r").ink
+
+    # Every pen-down point lands in a reserved cell.
+    cell = 5.0  # PlacementSettings default cellMm
+    for stroke in placed.strokes:
+        for x, y in stroke:
+            assert reserved[int(y // cell), int(x // cell)], (
+                f"ink at ({x:.0f}, {y:.0f}) is not reserved"
+            )
 
 
 def test_target_footprint_scaling_preserves_aspect():
@@ -103,5 +126,6 @@ def test_target_footprint_scaling_preserves_aspect():
 
 if __name__ == "__main__":
     test_clear_drawings_frees_occupancy()
+    test_inserted_drawings_are_reserved_where_their_ink_is()
     test_target_footprint_scaling_preserves_aspect()
     print("coordinator unit checks passed")

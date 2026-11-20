@@ -1,4 +1,4 @@
-"""Visual + behavioural check of the *active robot* half of ``compute_occupancy``.
+"""Visual + behavioural check of the *active robot* keep-out.
 
 What this exercises
 -------------------
@@ -6,7 +6,7 @@ What this exercises
 committed ink. This file covers the other source of keep-out: a **neighbouring
 robot that is drawing right now**. That robot is not ink to steer around, it's a
 moving body, and its stroke tells us both where its pen is *and* which way it is
-pointing — so ``compute_occupancy`` blocks the space the chassis actually sweeps
+pointing — so the engine blocks the space the chassis actually sweeps
 (``RobotBody``: 226mm nose-to-tail, 149mm wide, pen 76mm back from the nose)
 rather than a disc around every ink point.
 
@@ -38,6 +38,9 @@ Layout (all mm, global canvas frame)::
 ``tl`` is the subject on ``studio``, ``west`` on ``annex``. Relative to ``tl``:
 ``tr`` and ``bl`` share an edge, ``br`` only touches at a corner.
 
+The grids come from the engine itself (``canvas.occupancy``), the same ones a
+placement is searched against; the placements come from ``canvas.place``.
+
 Output lands in ``tests/output/active_robot_keepout/`` — one PNG per scenario,
 both canvases side by side:
 
@@ -58,9 +61,10 @@ import glob
 import json
 import math
 import os
-import random
 import sys
+from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
+from typing import Optional
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
@@ -74,11 +78,18 @@ if _REPO_ROOT not in sys.path:
 from release.canvas import (  # noqa: E402
     ROBOT_BODY,
     Canvas,
+    Occupancy,
+    PlacedDrawing,
+    Placement,
     PlacementConfig,
+    Point,
     Region,
     RobotBody,
     Stroke,
     commands_to_strokes,
+    occupancy,
+    place,
+    replay_to_world,
     split_lead_in,
 )
 
@@ -107,8 +118,23 @@ C_TEXT = (20, 20, 20)
 # --------------------------------------------------------------------------- #
 
 
-def _load_drawings() -> list[tuple[str, list[Stroke]]]:
-    """Every ``*.json`` in tests/vectorizations, as (name, pen-down polylines).
+@dataclass
+class Source:
+    """One vectorization, prepared the way the coordinator prepares a job."""
+
+    name: str
+    commands: list  # lead-in stripped
+    heading0: float
+    strokes: list[Stroke]  # native ink, local mm
+
+    @property
+    def span(self) -> float:
+        x0, y0, x1, y1 = _span(self.strokes)
+        return max(x1 - x0, y1 - y0)
+
+
+def _load_drawings() -> list[Source]:
+    """Every ``*.json`` in tests/vectorizations.
 
     These are the genuine article — turtle command lists straight from the
     vectorizer, arcs and all — run through the same ``split_lead_in`` +
@@ -117,18 +143,18 @@ def _load_drawings() -> list[tuple[str, list[Stroke]]]:
     real drawing's arcs and direction reversals exercise the sweep in ways a hand
     -drawn box never would.
     """
-    drawings: list[tuple[str, list[Stroke]]] = []
+    drawings: list[Source] = []
     for path in sorted(glob.glob(os.path.join(VEC_DIR, "*.json"))):
         with open(path) as fh:
             raw = json.load(fh)
         # SimpleNamespace duck-types canvas.py's Command protocol (.kind/.distance/
         # .penDown/.degrees/.radius) without dragging robots.py's pydantic in.
         commands = [SimpleNamespace(**c) for c in raw]
-        _lead_in, drawing, _start, _heading = split_lead_in(commands)
+        _lead_in, drawing, _start, heading0 = split_lead_in(commands)
         strokes = commands_to_strokes(drawing)
         if strokes:
             name = os.path.splitext(os.path.basename(path))[0].split(".")[0][:24]
-            drawings.append((name, strokes))
+            drawings.append(Source(name, drawing, heading0, strokes))
     return drawings
 
 
@@ -143,12 +169,7 @@ def _span(strokes: list[Stroke]) -> tuple[float, float, float, float]:
 
 
 def _fit(strokes: list[Stroke], target_mm: float) -> list[Stroke]:
-    """Uniformly scale so the drawing's longest side is ``target_mm``.
-
-    The source vectorizations are ~850mm across — bigger than a region — which is
-    why the coordinator scales to ``target_footprint_mm`` before placing. Same idea,
-    done directly on the strokes so this test doesn't need the coordinator.
-    """
+    """Uniformly scale so the drawing's longest side is ``target_mm``."""
     x0, y0, x1, y1 = _span(strokes)
     longest = max(x1 - x0, y1 - y0)
     f = target_mm / longest if longest else 1.0
@@ -172,9 +193,9 @@ def _reversed(strokes: list[Stroke]) -> list[Stroke]:
 
 ACTIVE_MM = 190.0  # footprint the live robot's drawing is sized to
 
-_D0 = _fit(DRAWINGS[0][1], ACTIVE_MM)
-_D1 = _fit(DRAWINGS[1][1], ACTIVE_MM)
-_D2 = _fit(DRAWINGS[2][1], ACTIVE_MM)
+_D0 = _fit(DRAWINGS[0].strokes, ACTIVE_MM)
+_D1 = _fit(DRAWINGS[1].strokes, ACTIVE_MM)
+_D2 = _fit(DRAWINGS[2].strokes, ACTIVE_MM)
 
 # A real drawing just east of the x=500 divide: in `tr` on studio, `east` on annex.
 NEAR_EDGE: list[Stroke] = _at(_D0, 515.0, 60.0)
@@ -194,38 +215,109 @@ NEAR_EDGE_REVERSED: list[Stroke] = _reversed(NEAR_EDGE)
 # --------------------------------------------------------------------------- #
 
 
+@dataclass
+class World:
+    """A canvas plus what's been drawn on it — everything the engine is given."""
+
+    canvas: Canvas
+    drawings: list[PlacedDrawing] = field(default_factory=list)
+
+    @property
+    def id(self) -> str:
+        return self.canvas.id
+
+    def region(self, region_id: str) -> Region:
+        return next(r for r in self.canvas.regions if r.id == region_id)
+
+
 def _cfg() -> PlacementConfig:
-    return PlacementConfig(cell_mm=CELL_MM)
+    # ``origin`` keeps every placement in this file deterministic.
+    return PlacementConfig(cell_mm=CELL_MM, strategy="origin")
 
 
 COMMIT_MM = 200.0  # footprint the committed drawings are sized to
 
 
-def _place(region: Region, canvas: Canvas, drawings: list[list[Stroke]]) -> None:
-    """Commit real drawings into ``region`` via the actual placement search.
+def _scaled(commands: list, scale: float) -> list:
+    """robots.py ``scale_commands``: lengths scale, angles don't."""
+    out = []
+    for c in commands:
+        if c.kind == "line":
+            out.append(SimpleNamespace(kind="line", distance=c.distance * scale, penDown=c.penDown))
+        elif c.kind == "arc":
+            out.append(SimpleNamespace(kind="arc", radius=c.radius * scale, degrees=c.degrees))
+        else:
+            out.append(c)
+    return out
 
-    Not hand-stamped: each drawing is sized to ``COMMIT_MM`` and then run through
-    ``try_place``/``commit``, so the region ends up holding ink at poses the search
-    genuinely chose (``origin`` strategy, so it's deterministic). That makes the
-    committed side of ``compute_occupancy`` real too, not just the active side.
+
+def _world_strokes(source: Source, p: Placement) -> list[Stroke]:
+    """The ink the robot lays down for this placement (robots.py ``add_drawing``)."""
+    return replay_to_world(
+        _scaled(source.commands, p.scale), p.anchor_x, p.anchor_y, source.heading0 + p.angle_deg
+    )
+
+
+def _place(
+    world: World,
+    region: Region,
+    source: Source,
+    size_mm: float,
+    active: Optional[dict] = None,
+    seed: int = 0,
+) -> Optional[tuple[Placement, list[Stroke]]]:
+    """Ask the engine to place ``source`` (sized to ``size_mm``) in ``region``.
+
+    Returns the placement and its world-mm ink, or None. Doesn't record it.
     """
-    for strokes in drawings:
-        context = region.prepare(
-            general_buffer=GENERAL_BUFFER, canvas=canvas, active_drawings={}
+    sized = replace(region, config=replace(region.config, target_footprint_mm=size_mm))
+    canvas = replace(
+        world.canvas, regions=[sized if r.id == region.id else r for r in world.canvas.regions]
+    )
+    p = place(
+        canvas, sized, world.drawings, source.commands, source.heading0, source.span,
+        active=active, seed=seed,
+    )
+    return None if p is None else (p, _world_strokes(source, p))
+
+
+def _record(world: World, region: Region, p: Placement, strokes: list[Stroke]) -> None:
+    world.drawings.append(
+        PlacedDrawing(
+            job_id=f"job{len(world.drawings)}",
+            robot_name=region.robot or "",
+            anchor_x=p.anchor_x,
+            anchor_y=p.anchor_y,
+            angle_deg=p.angle_deg,
+            commands=[],
+            strokes=strokes,
+            exit_pose_x=0.0,
+            exit_pose_y=0.0,
+            exit_pose_deg=0.0,
         )
-        placement = region.try_place(_fit(strokes, COMMIT_MM), context)
-        assert (
-            placement is not None
-        ), f"a {COMMIT_MM:g}mm drawing would not fit {region.id}"
-        region.commit(placement)
+    )
 
 
-def _studio(with_ink: bool = True) -> Canvas:
+def _commit(world: World, region_id: str, sources: list[Source]) -> None:
+    """Put real drawings into a region via the actual placement search.
+
+    Not hand-placed: each drawing is sized to ``COMMIT_MM`` and run through
+    ``place``, so the region ends up holding ink at poses the search genuinely
+    chose. That makes the committed side of the keep-out real too.
+    """
+    region = world.region(region_id)
+    for source in sources:
+        hit = _place(world, region, source, COMMIT_MM)
+        assert hit is not None, f"a {COMMIT_MM:g}mm drawing would not fit {region.id}"
+        _record(world, region, *hit)
+
+
+def _studio(with_ink: bool = True) -> World:
     """1000x1000 carved into four 500x500 quadrants. Subject is ``tl``.
 
-    ``with_ink=False`` leaves the grids empty, so ``compute_occupancy`` at a zero
-    buffer returns the active-robot keep-out and nothing else — which is what the
-    geometry tests want to compare against ground truth.
+    ``with_ink=False`` leaves the regions empty, so the keep-out is the
+    active-robot layer and nothing else — which is what the geometry tests want
+    to compare against ground truth.
     """
     quads = [
         ("tl", 0.0, 0.0, "botA"),
@@ -233,69 +325,56 @@ def _studio(with_ink: bool = True) -> Canvas:
         ("bl", 0.0, 500.0, "botC"),
         ("br", 500.0, 500.0, "botD"),
     ]
-    regions = [
-        Region(id=i, x=x, y=y, width=500.0, height=500.0, robot=bot, config=_cfg())
-        for i, x, y, bot in quads
-    ]
-    canvas = Canvas(
-        id="studio",
-        width=1000.0,
-        height=1000.0,
-        general_buffer=GENERAL_BUFFER,
-        regions=regions,
+    world = World(
+        Canvas(
+            id="studio",
+            width=1000.0,
+            height=1000.0,
+            general_buffer=GENERAL_BUFFER,
+            regions=[
+                Region(id=i, x=x, y=y, width=500.0, height=500.0, robot=bot, config=_cfg())
+                for i, x, y, bot in quads
+            ],
+        )
     )
-    # Real drawings, committed the way the coordinator commits them: through the
-    # placement search, not stamped at a pose we chose.
     if with_ink:
-        _place(regions[0], canvas, [DRAWINGS[0][1], DRAWINGS[2][1]])
-    return canvas
+        _commit(world, "tl", [DRAWINGS[0], DRAWINGS[2]])
+    return world
 
 
-def _annex(with_ink: bool = True) -> Canvas:
+def _annex(with_ink: bool = True) -> World:
     """1000x500 split into two 500x500 halves. Subject is ``west``.
 
     Deliberately overlaps ``studio``'s coordinate space: ``east`` covers the same
     mm as ``studio/tr``, so the same strokes are meaningful on both canvases and
     the canvas gate is the only thing telling them apart.
     """
-    regions = [
-        Region(
-            id="west",
-            x=0.0,
-            y=0.0,
-            width=500.0,
+    world = World(
+        Canvas(
+            id="annex",
+            width=1000.0,
             height=500.0,
-            robot="botE",
-            config=_cfg(),
-        ),
-        Region(
-            id="east",
-            x=500.0,
-            y=0.0,
-            width=500.0,
-            height=500.0,
-            robot="botF",
-            config=_cfg(),
-        ),
-    ]
-    canvas = Canvas(
-        id="annex",
-        width=1000.0,
-        height=500.0,
-        general_buffer=GENERAL_BUFFER,
-        regions=regions,
+            general_buffer=GENERAL_BUFFER,
+            regions=[
+                Region(id="west", x=0.0, y=0.0, width=500.0, height=500.0, robot="botE", config=_cfg()),
+                Region(id="east", x=500.0, y=0.0, width=500.0, height=500.0, robot="botF", config=_cfg()),
+            ],
+        )
     )
     if with_ink:
-        _place(regions[0], canvas, [DRAWINGS[1][1]])
-    return canvas
+        _commit(world, "west", [DRAWINGS[1]])
+    return world
 
 
 SUBJECT_OF = {"studio": "tl", "annex": "west"}
 
 
-def _subject(canvas: Canvas) -> Region:
-    target = SUBJECT_OF[canvas.id]
-    return next(r for r in canvas.regions if r.id == target)
+def _subject(world: World) -> Region:
+    return world.region(SUBJECT_OF[world.id])
+
+
+def _occ(world: World, active: dict, region: Optional[Region] = None) -> Occupancy:
+    return occupancy(world.canvas, region or _subject(world), world.drawings, active)
 
 
 # --------------------------------------------------------------------------- #
@@ -367,33 +446,28 @@ SCENARIOS: list[dict] = [
 # --------------------------------------------------------------------------- #
 
 
-def _layers(canvas: Canvas, active: dict) -> tuple[np.ndarray, np.ndarray]:
+def _layers(world: World, active: dict) -> tuple[np.ndarray, np.ndarray]:
     """(keep-out from committed ink, keep-out added by live robots) for the subject."""
-    subject = _subject(canvas)
-    static = subject.compute_occupancy(
-        general_buffer=GENERAL_BUFFER, canvas=canvas, active_drawings={}
-    )
-    full = subject.compute_occupancy(
-        general_buffer=GENERAL_BUFFER, canvas=canvas, active_drawings=active
-    )
-    return static, full & ~static
+    occ = _occ(world, active)
+    return occ.buffered, occ.keepout & ~occ.buffered
 
 
-def _canvas_image(canvas: Canvas, active: dict) -> Image.Image:
+def _canvas_image(world: World, active: dict) -> Image.Image:
     """One canvas, rendered at cell resolution in the global mm frame."""
+    canvas = world.canvas
     h = int(math.ceil(canvas.height / CELL_MM))
     w = int(math.ceil(canvas.width / CELL_MM))
     rgb = np.full((h, w, 3), C_FREE, dtype=np.uint8)
 
-    subject = _subject(canvas)
-    static, from_active = _layers(canvas, active)
+    subject = _subject(world)
+    static, from_active = _layers(world, active)
 
     def offset(region: Region) -> tuple[int, int]:
         return int(round(region.y / CELL_MM)), int(round(region.x / CELL_MM))
 
     # Keep-out layers live only in the subject region.
     r0, c0 = offset(subject)
-    rows, cols = subject.grid.shape
+    rows, cols = static.shape
     view = rgb[r0 : r0 + rows, c0 : c0 + cols]
     view[static] = C_BUFFER
     view[from_active] = C_ACTIVE
@@ -401,14 +475,14 @@ def _canvas_image(canvas: Canvas, active: dict) -> Image.Image:
     # Committed ink for every region, drawn over the halos it produced.
     for region in canvas.regions:
         rr, cc = offset(region)
-        ink = region.grid.astype(bool)
+        ink = _occ(world, {}, region).ink
         rgb[rr : rr + ink.shape[0], cc : cc + ink.shape[1]][ink] = C_INK
 
     img = Image.fromarray(rgb, mode="RGB")
     draw = ImageDraw.Draw(img)
 
     # The live strokes, but only for robots that actually live on this canvas —
-    # otherwise the picture would imply a reach that compute_occupancy ignores.
+    # otherwise the picture would imply a reach the engine ignores.
     for name, strokes in active.items():
         if not strokes or canvas.region_for_robot(name) is None:
             continue
@@ -437,10 +511,10 @@ def _canvas_image(canvas: Canvas, active: dict) -> Image.Image:
     return img
 
 
-def _render_scenario(scenario: dict, canvases: list[Canvas]) -> str:
+def _render_scenario(scenario: dict, worlds: list[World]) -> str:
     """Both canvases side by side, titled, into one PNG."""
     font = ImageFont.load_default()
-    images = [(c, _canvas_image(c, scenario["active"])) for c in canvases]
+    images = [(wd, _canvas_image(wd, scenario["active"])) for wd in worlds]
 
     gap, pad, header, caption = 24, 12, 30, 18
     body_w = sum(img.width for _, img in images) + gap * (len(images) - 1)
@@ -458,11 +532,11 @@ def _render_scenario(scenario: dict, canvases: list[Canvas]) -> str:
     )
 
     x = pad
-    for canvas, img in images:
-        verdict = scenario["expect"][canvas.id]
+    for wd, img in images:
+        verdict = scenario["expect"][wd.id]
         draw.text(
             (x, pad + header),
-            f"{canvas.id} (subject: {_subject(canvas).id}) - {verdict}",
+            f"{wd.id} (subject: {_subject(wd).id}) - {verdict}",
             fill=C_TEXT,
             font=font,
         )
@@ -481,22 +555,121 @@ def _render_scenario(scenario: dict, canvases: list[Canvas]) -> str:
 
 def run_demo() -> dict:
     os.makedirs(OUT_DIR, exist_ok=True)
-    canvases = [_studio(), _annex()]
+    worlds = [_studio(), _annex()]
 
     results = []
     for scenario in SCENARIOS:
-        path = _render_scenario(scenario, canvases)
+        path = _render_scenario(scenario, worlds)
         per_canvas = {}
-        for canvas in canvases:
-            static, from_active = _layers(canvas, scenario["active"])
-            per_canvas[canvas.id] = {
+        for wd in worlds:
+            static, from_active = _layers(wd, scenario["active"])
+            per_canvas[wd.id] = {
                 "buffer_cells": int(static.sum()),
                 "active_cells": int(from_active.sum()),
-                "expect": scenario["expect"][canvas.id],
+                "expect": scenario["expect"][wd.id],
             }
         results.append({"name": scenario["name"], "png": path, "canvases": per_canvas})
 
     return {"out_dir": OUT_DIR, "scenarios": results}
+
+
+# --------------------------------------------------------------------------- #
+# Independent geometry (ground truth for the engine's grids)
+# --------------------------------------------------------------------------- #
+
+
+def _shape(region: Region) -> tuple[int, int]:
+    cell = region.config.cell_mm
+    return int(math.ceil(region.height / cell)), int(math.ceil(region.width / cell))
+
+
+def _brute_sweep(region: Region, strokes: list[Stroke], body: RobotBody) -> np.ndarray:
+    """Ground truth: a cell is covered iff its corner lies under some body pose.
+
+    Derived from the geometry directly, so it's an independent check. Working in
+    the heading frame, the body at pen position P covers offsets ``along in
+    [-pen_from_tail, +pen_from_nose]`` and ``|across| <= width/2``; sweeping P
+    along the segment just widens the along-interval by the segment's length.
+    """
+    cell = region.config.cell_mm
+    rows, cols = _shape(region)
+    rr, cc = np.meshgrid(np.arange(rows), np.arange(cols), indexing="ij")
+    px = region.x + cc * cell
+    py = region.y + rr * cell
+
+    covered = np.zeros((rows, cols), dtype=bool)
+    for stroke in strokes:
+        for a, b in zip(stroke[:-1], stroke[1:]):
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            seg = math.hypot(dx, dy)
+            if seg == 0:
+                continue
+            ux, uy = dx / seg, dy / seg
+            nx, ny = -uy, ux
+            ax, ay = px - a[0], py - a[1]
+            along = ax * ux + ay * uy
+            across = ax * nx + ay * ny
+            covered |= (
+                (along >= -body.pen_from_tail_mm)
+                & (along <= seg + body.pen_from_nose_mm)
+                & (np.abs(across) <= body.width_mm / 2.0)
+            )
+    return covered
+
+
+def _body_rect(a: Point, b: Point, body: RobotBody, margin: float) -> Optional[list[Point]]:
+    """The rectangle our chassis sweeps while the pen goes a -> b, inflated by
+    ``margin`` — the same model the engine uses, written out independently."""
+    dx, dy = b[0] - a[0], b[1] - a[1]
+    dist = math.hypot(dx, dy)
+    if dist == 0.0:
+        return None
+    ux, uy = dx / dist, dy / dist
+    nx, ny = -uy, ux
+    back = body.pen_from_tail_mm + margin
+    front = body.pen_from_nose_mm + margin
+    rx, ry = a[0] - ux * back, a[1] - uy * back
+    fx, fy = b[0] + ux * front, b[1] + uy * front
+    hw = body.width_mm / 2.0 + margin
+    return [
+        (rx + nx * hw, ry + ny * hw),
+        (fx + nx * hw, fy + ny * hw),
+        (fx - nx * hw, fy - ny * hw),
+        (rx - nx * hw, ry - ny * hw),
+    ]
+
+
+def _swept(region: Region, strokes: list[Stroke], body: RobotBody) -> np.ndarray:
+    """Our own body swept along ``strokes`` (global mm), in region cells (PIL)."""
+    rows, cols = _shape(region)
+    cell = region.config.cell_mm
+    img = Image.new("1", (cols, rows), 0)
+    d = ImageDraw.Draw(img)
+    for s in strokes:
+        for a, b in zip(s[:-1], s[1:]):
+            poly = _body_rect(a, b, body, cell)
+            if poly:
+                d.polygon(
+                    [((p[0] - region.x) / cell, (p[1] - region.y) / cell) for p in poly],
+                    fill=1,
+                )
+    return np.array(img, dtype=bool)
+
+
+def _ink(region: Region, strokes: list[Stroke]) -> np.ndarray:
+    """What a placement effectively tests: the pen path plus pen/2 + clearance."""
+    cfg = region.config
+    rows, cols = _shape(region)
+    img = Image.new("1", (cols, rows), 0)
+    d = ImageDraw.Draw(img)
+    w = int(round(2 * (cfg.pen_mm / 2 + cfg.clearance_mm) / cfg.cell_mm)) + 1
+    for s in strokes:
+        d.line(
+            [((p[0] - region.x) / cfg.cell_mm, (p[1] - region.y) / cfg.cell_mm) for p in s],
+            fill=1,
+            width=w,
+        )
+    return np.array(img, dtype=bool)
 
 
 # --------------------------------------------------------------------------- #
@@ -522,19 +695,14 @@ def test_renders_every_scenario():
 
 
 def test_adjacency_is_what_gates_reach():
-    """A neighbour sharing an edge reaches us; one sharing only a corner cannot."""
+    """A neighbour sharing an edge reaches us; one sharing only a corner cannot —
+    identical ink, one region over, opposite outcome."""
     studio = _studio()
-    tl = _subject(studio)
-
-    assert tl.adjoins(next(r for r in studio.regions if r.id == "tr"))
-    assert tl.adjoins(next(r for r in studio.regions if r.id == "bl"))
-    assert not tl.adjoins(next(r for r in studio.regions if r.id == "br"))
-
-    # ...and that distinction is exactly what compute_occupancy acts on: identical
-    # ink, one region over, opposite outcome.
     _, from_edge = _layers(studio, {"botB": NEAR_EDGE})
+    _, from_south_edge = _layers(studio, {"botC": SOUTH_EDGE})
     _, from_corner = _layers(studio, {"botD": CORNER_ONLY})
     assert from_edge.any()
+    assert from_south_edge.any()
     assert not from_corner.any()
 
 
@@ -569,56 +737,19 @@ def test_multiple_active_robots_union():
     np.testing.assert_array_equal(both, east | south)
 
 
-def _brute_sweep(region: Region, strokes: list[Stroke], body: RobotBody) -> np.ndarray:
-    """Ground truth: a cell is covered iff its centre lies under some body pose.
-
-    Derived from the geometry rather than from ``_body_sweep``, so it's an
-    independent check. Working in the heading frame, the body at pen position P
-    covers offsets ``along in [-pen_from_tail, +pen_from_nose]`` and
-    ``|across| <= width/2``; sweeping P along the segment just widens the
-    along-interval by the segment's length.
-    """
-    cell = region.config.cell_mm
-    rows, cols = region.grid.shape
-    rr, cc = np.meshgrid(np.arange(rows), np.arange(cols), indexing="ij")
-    px = region.x + cc * cell
-    py = region.y + rr * cell
-
-    covered = np.zeros((rows, cols), dtype=bool)
-    for stroke in strokes:
-        for a, b in zip(stroke[:-1], stroke[1:]):
-            dx, dy = b[0] - a[0], b[1] - a[1]
-            seg = math.hypot(dx, dy)
-            if seg == 0:
-                continue
-            ux, uy = dx / seg, dy / seg
-            nx, ny = -uy, ux
-            ax, ay = px - a[0], py - a[1]
-            along = ax * ux + ay * uy
-            across = ax * nx + ay * ny
-            covered |= (
-                (along >= -body.pen_from_tail_mm)
-                & (along <= seg + body.pen_from_nose_mm)
-                & (np.abs(across) <= body.width_mm / 2.0)
-            )
-    return covered
-
-
 def test_keepout_is_the_swept_body_and_never_under_covers():
-    """The keep-out is the body swept along the stroke — and it never leaves a hole.
+    """The live keep-out is the body swept along the stroke — and never leaves a hole.
 
     Checked against an independently-derived ground truth. Over-covering is fine
-    (``_body_sweep`` inflates by a cell so rasterization can't leave a sliver of
-    chassis unblocked); under-covering would be a collision.
+    (the sweep is inflated by a cell so rasterizing can't leave a sliver of chassis
+    unblocked); under-covering would be a collision.
     """
     for strokes in (NEAR_EDGE, NEAR_EDGE_REVERSED, CORNER_ONLY):
         studio = _studio(with_ink=False)
         tl = _subject(studio)
-        # The bare swept body, before compute_occupancy grows it by the query
-        # robot's overhang — that growth is the broad-phase margin and has its own
-        # tests below. Reaching for the private helper keeps this check on the one
-        # thing it is about: is the sweep itself the right shape.
-        full = tl._active_robot_keepout(studio, {"botB": strokes}, ROBOT_BODY)
+        # The bare swept body, before the engine grows it by the query robot's
+        # overhang — that growth is the broad-phase margin, tested below.
+        full = _occ(studio, {"botB": strokes}).bodies
         truth = _brute_sweep(tl, strokes, ROBOT_BODY)
 
         missed = truth & ~full
@@ -640,68 +771,14 @@ def test_heading_changes_the_keepout():
     they differ is the whole reason for modelling the body.
     """
     studio = _studio(with_ink=False)
-    tl = _subject(studio)
-
-    def keepout(strokes):
-        return tl.compute_occupancy(
-            general_buffer=0, canvas=studio, active_drawings={"botB": strokes}
-        )
-
-    forward = keepout(NEAR_EDGE)
-    backward = keepout(NEAR_EDGE_REVERSED)
+    forward = _occ(studio, {"botB": NEAR_EDGE}).keepout
+    backward = _occ(studio, {"botB": NEAR_EDGE_REVERSED}).keepout
 
     assert forward.any() and backward.any(), "test geometry proves nothing"
     assert not np.array_equal(forward, backward), (
         "reversing the drawing left the keep-out identical — the heading is being "
         "ignored, which is exactly what the disc model got wrong"
     )
-
-
-def _swept(region: Region, strokes: list[Stroke], body: RobotBody) -> np.ndarray:
-    """Our own body swept along ``strokes`` (already global mm), in region cells."""
-    from PIL import Image as _I, ImageDraw as _D
-
-    from release.canvas import _body_sweep
-
-    rows, cols = region.grid.shape
-    img = _I.new("1", (cols, rows), 0)
-    d = _D.Draw(img)
-    for s in strokes:
-        for a, b in zip(s[:-1], s[1:]):
-            poly = _body_sweep(a, b, body, region.config.cell_mm)
-            if poly:
-                d.polygon(
-                    [
-                        (
-                            (p[0] - region.x) / region.config.cell_mm,
-                            (p[1] - region.y) / region.config.cell_mm,
-                        )
-                        for p in poly
-                    ],
-                    fill=1,
-                )
-    return np.array(img, dtype=bool)
-
-
-def _ink(region: Region, strokes: list[Stroke]) -> np.ndarray:
-    """What try_place effectively tests: the pen path plus pen/2 + clearance."""
-    from PIL import Image as _I, ImageDraw as _D
-
-    cfg = region.config
-    rows, cols = region.grid.shape
-    img = _I.new("1", (cols, rows), 0)
-    d = _D.Draw(img)
-    w = int(round(2 * (cfg.pen_mm / 2 + cfg.clearance_mm) / cfg.cell_mm)) + 1
-    for s in strokes:
-        d.line(
-            [
-                ((p[0] - region.x) / cfg.cell_mm, (p[1] - region.y) / cfg.cell_mm)
-                for p in s
-            ],
-            fill=1,
-            width=w,
-        )
-    return np.array(img, dtype=bool)
 
 
 def test_broad_phase_is_sound_and_narrow_phase_is_necessary():
@@ -711,17 +788,13 @@ def test_broad_phase_is_sound_and_narrow_phase_is_necessary():
     it at *every* heading. Growing a live robot's body by it therefore blocks only
     placements that are *certain* to collide — a sound broad phase. But it is a
     filter, not a gate: between ``min_overhang_mm`` and ``reach_mm`` whether we
-    touch depends on which way we point, so the survivors still need
-    ``body_collides``. This pins both halves at once.
+    touch depends on which way we point, so the engine still sweeps our own body
+    for the survivors. This pins both halves at once.
     """
     studio = _studio(with_ink=False)
     tl = _subject(studio)
-    active = {"botB": NEAR_EDGE}
-
-    broad = tl.compute_occupancy(
-        general_buffer=GENERAL_BUFFER, canvas=studio, active_drawings=active
-    )
-    their_body = tl._active_robot_keepout(studio, active, ROBOT_BODY)
+    occ = _occ(studio, {"botB": NEAR_EDGE})
+    broad, their_body = occ.keepout, occ.bodies
 
     sound = 0
     needed_narrow = 0
@@ -750,73 +823,29 @@ def test_broad_phase_is_sound_and_narrow_phase_is_necessary():
     )
 
 
-def test_body_collides_matches_the_real_geometry():
-    """``body_collides`` agrees with sweeping our body by hand, via a real Placement."""
-    studio = _studio(with_ink=False)
-    tl = _subject(studio)
-    active = {"botB": NEAR_EDGE}
-    their_body = tl._active_robot_keepout(studio, active, ROBOT_BODY)
+def _chassis(strokes: list[Stroke]):
+    """The exact area a chassis sweeps along ``strokes`` (shapely, no raster)."""
+    from shapely.geometry import Polygon
+    from shapely.ops import unary_union
 
-    ours_local = _fit(DRAWINGS[1][1], 170.0)
-    context = tl.prepare(
-        general_buffer=GENERAL_BUFFER, canvas=studio, active_drawings=active
+    return unary_union(
+        [
+            Polygon(rect)
+            for s in strokes
+            for a, b in zip(s[:-1], s[1:])
+            if (rect := _body_rect(a, b, ROBOT_BODY, 0.0)) is not None
+        ]
     )
-    placement = tl.try_place(ours_local, context)
-    assert placement is not None
-
-    world = tl.placed_strokes(placement, ours_local)
-    expected = bool((_swept(tl, world, ROBOT_BODY) & their_body).any())
-    got = tl.body_collides(placement, ours_local, context)
-    assert got == expected
-    assert not got, "try_place returned a pose its own narrow phase rejects"
 
 
-def test_body_collides_is_free_when_nobody_is_drawing():
-    """No live neighbour -> the narrow phase must short-circuit, not just return False."""
-    studio = _studio(with_ink=False)
-    tl = _subject(studio)
-    ours_local = _fit(DRAWINGS[1][1], 170.0)
-    base = tl.prepare(general_buffer=GENERAL_BUFFER, canvas=studio, active_drawings={})
-    placement = tl.try_place(ours_local, base)
-    assert placement is not None
+def test_place_never_returns_a_colliding_pose():
+    """The headline guarantee: a pose ``place`` hands back is one we can draw.
 
-    for active in ({}, {"botB": None}, {"botD": CORNER_ONLY}, {"botB": OUT_OF_REACH}):
-        ctx = tl.prepare(
-            general_buffer=GENERAL_BUFFER, canvas=studio, active_drawings=active
-        )
-        assert not ctx.has_live_neighbour, f"{active!r} should not count as live"
-        assert not tl.body_collides(
-            placement, ours_local, ctx
-        ), f"claimed a collision with {active!r}"
-
-
-def test_placed_strokes_land_on_the_anchor():
-    """``placed_strokes`` must reproduce the ink the robot actually draws."""
-    studio = _studio(with_ink=False)
-    tl = _subject(studio)
-    ours_local = _fit(DRAWINGS[0][1], 170.0)
-    context = tl.prepare(
-        general_buffer=GENERAL_BUFFER, canvas=studio, active_drawings={}
-    )
-    placement = tl.try_place(ours_local, context)
-    assert placement is not None
-
-    world = tl.placed_strokes(placement, ours_local)
-    first = world[0][0]
-    assert abs(first[0] - placement.anchor_x) < 1e-6
-    assert abs(first[1] - placement.anchor_y) < 1e-6
-    # rigid: the same number of strokes and points, and lengths preserved
-    assert [len(s) for s in world] == [len(s) for s in ours_local]
-
-
-def test_try_place_never_returns_a_colliding_pose():
-    """The headline guarantee: a pose ``try_place`` hands back is one we can draw.
-
-    It is the definitive "can this go here", so it owns both tests — callers don't
-    have to know a narrow phase exists. This drives it against live neighbours from
-    several directions, with the region progressively filling so the search is
-    pushed toward the contested edge, and checks every returned pose by sweeping our
-    body for real.
+    Drives it against live neighbours from several directions, with the region
+    progressively filling so the search is pushed toward the contested edge, and
+    checks every returned pose against the exact geometry: our chassis swept along
+    our ink must not touch theirs swept along theirs. (Exact rather than
+    rasterized, so the check doesn't depend on how either side samples cells.)
     """
     for label, active in (
         ("east", {"botB": NEAR_EDGE}),
@@ -826,34 +855,47 @@ def test_try_place_never_returns_a_colliding_pose():
     ):
         studio = _studio(with_ink=False)
         tl = _subject(studio)
-        their_body = tl._active_robot_keepout(studio, active, ROBOT_BODY)
+        theirs = [_chassis(strokes) for strokes in active.values()]
 
         placed = 0
         for i in range(6):  # keep placing so the region fills toward the neighbour
-            context = tl.prepare(
-                general_buffer=GENERAL_BUFFER, canvas=studio, active_drawings=active
-            )
-            drawing = _fit(DRAWINGS[i % len(DRAWINGS)][1], 150.0)
-            placement = tl.try_place(drawing, context)
-            if placement is None:
+            hit = _place(studio, tl, DRAWINGS[i % len(DRAWINGS)], 150.0, active=active)
+            if hit is None:
                 break
+            placement, world = hit
             placed += 1
-            world = tl.placed_strokes(placement, drawing)
-            hit = int((_swept(tl, world, ROBOT_BODY) & their_body).sum())
-            assert hit == 0, (
-                f"[{label}] try_place returned a pose whose chassis overlaps a live "
-                f"robot by {hit} cells"
-            )
-            tl.commit(placement)
+            ours = _chassis(world)
+            for body in theirs:
+                gap = ours.distance(body)
+                assert gap > 0, (
+                    f"[{label}] place returned a pose whose chassis touches a live "
+                    f"robot's"
+                )
+            _record(studio, tl, placement, world)
         assert placed, f"[{label}] nothing placed — this proves nothing"
 
 
-def test_try_place_is_unaffected_when_nobody_is_drawing():
-    """The narrow phase must be inert when no neighbour is live.
+def test_placement_lands_on_the_anchor():
+    """The world ink for a placement starts exactly at its anchor (the pose the
+    robot is sent to), and stays inside the region."""
+    studio = _studio(with_ink=False)
+    tl = _subject(studio)
+    hit = _place(studio, tl, DRAWINGS[0], 170.0)
+    assert hit is not None
+    placement, world = hit
+
+    first = world[0][0]
+    assert abs(first[0] - placement.anchor_x) < 1e-6
+    assert abs(first[1] - placement.anchor_y) < 1e-6
+    x0, y0, x1, y1 = _span(world)
+    assert tl.x <= x0 and x1 <= tl.x + tl.width and tl.y <= y0 and y1 <= tl.y + tl.height
+
+
+def test_place_is_unaffected_when_nobody_is_drawing():
+    """Robots that can't reach us must change nothing.
 
     Same seed, same drawings: an idle dict and a dict full of robots that can't
-    reach us must produce byte-identical placements, so the collision machinery
-    costs nothing (and changes nothing) in the common case.
+    reach us must produce identical placements.
     """
 
     def run(active):
@@ -861,15 +903,12 @@ def test_try_place_is_unaffected_when_nobody_is_drawing():
         tl = _subject(studio)
         out = []
         for i in range(4):
-            ctx = tl.prepare(
-                general_buffer=GENERAL_BUFFER, canvas=studio, active_drawings=active
-            )
-            d = _fit(DRAWINGS[i % len(DRAWINGS)][1], 150.0)
-            p = tl.try_place(d, ctx, rng=random.Random(7))
-            if p is None:
+            hit = _place(studio, tl, DRAWINGS[i % len(DRAWINGS)], 150.0, active=active, seed=7)
+            if hit is None:
                 break
-            out.append((p.angle_deg, p._top, p._left))
-            tl.commit(p)
+            placement, world = hit
+            out.append((placement.angle_deg, placement.anchor_x, placement.anchor_y))
+            _record(studio, tl, placement, world)
         return out
 
     idle = run({})
@@ -880,37 +919,15 @@ def test_try_place_is_unaffected_when_nobody_is_drawing():
         ), f"{active!r} perturbed placement despite being out of reach"
 
 
-def test_compute_occupancy_does_not_mutate_the_grid():
-    """It snapshots. Running every scenario must leave the committed grids alone."""
-    studio = _studio()
-    before = {r.id: r.grid.copy() for r in studio.regions}
-    for scenario in SCENARIOS:
-        for region in studio.regions:
-            region.compute_occupancy(
-                general_buffer=GENERAL_BUFFER,
-                canvas=studio,
-                active_drawings=scenario["active"],
-            )
-    for region in studio.regions:
-        np.testing.assert_array_equal(region.grid, before[region.id])
-
-
 def test_active_keepout_composes_with_the_buffer():
     """The two sources OR together — neither replaces the other."""
     studio = _studio()
-    tl = _subject(studio)
+    occ = _occ(studio, {"botB": NEAR_EDGE})
 
-    static, from_active = _layers(studio, {"botB": NEAR_EDGE})
-    full = tl.compute_occupancy(
-        general_buffer=GENERAL_BUFFER,
-        canvas=studio,
-        active_drawings={"botB": NEAR_EDGE},
-    )
-
-    assert full.shape == tl.grid.shape
-    assert full.dtype == np.bool_
-    np.testing.assert_array_equal(full, static | from_active)
-    assert np.all(full[tl.grid.astype(bool)]), "committed ink stopped being kept out"
+    assert occ.keepout.dtype == np.bool_
+    assert occ.active.any() and occ.buffered.any()
+    np.testing.assert_array_equal(occ.keepout, occ.buffered | occ.active)
+    assert np.all(occ.keepout[occ.ink]), "committed ink stopped being kept out"
 
 
 if __name__ == "__main__":

@@ -14,12 +14,13 @@ a **Locate → Poll → Draw** loop and the server is the matchmaker:
    follows the exit path off the canvas, then loops back to Locate.
 
 Unlike a naive design, the **server owns the canvas model**: every canvas, its
-markers, its regions (one region per robot), and — crucially — a per-region
-*occupancy grid* so a new drawing never overlaps an existing one. When a bot is
-handed a job the coordinator runs a placement search (rotation + offset) in that
-bot's region, reserves the footprint, and returns the resulting start pose. The
-heavy geometry (footprint rasterization, occupancy, placement) lives in
-``canvas.py``; this module is the wire protocol, config, and matchmaking.
+markers, its regions (one region per robot), and — crucially — the list of
+drawings already on each canvas, so a new drawing never overlaps an existing one.
+When a bot is handed a job the coordinator runs a placement search (rotation +
+offset) in that bot's region, records the drawing, and returns the resulting
+start pose. The search itself is the stateless Rust engine behind ``canvas.py``
+(it rebuilds occupancy from the drawings list on every call); this module is the
+wire protocol, config, and matchmaking.
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ import random
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import math
 from typing import (
     Annotated,
@@ -389,6 +390,36 @@ class _StagedJob:
     commands: list[DrawingCommand]  # the drawing with its lead-in stripped off
 
 
+class _FreeFractions:
+    """Per-region free fractions, asked of the engine at most once per canvas.
+
+    Lives for one ``_assign_locked`` pass or one ``snapshot`` — under the lock,
+    never between calls. Ranking bots asks for these per candidate per job, and
+    each engine call rebuilds the whole canvas, so this saves repeats within the
+    pass; ``placed`` drops a canvas's figures the moment its drawings change.
+    """
+
+    def __init__(self, coord: "_Coordinator") -> None:
+        self._coord = coord
+        self._by_canvas: dict[str, dict[str, float]] = {}
+
+    def for_robot(self, robot_name: str) -> Optional[float]:
+        canvas = self._coord._store.canvas_for_robot(robot_name)
+        region = self._coord._store.region_for_robot(robot_name)
+        if canvas is None or region is None:
+            return None
+        figures = self._by_canvas.get(canvas.id)
+        if figures is None:
+            figures = canvas_engine.free_fractions(
+                canvas, self._coord._drawings.get(canvas.id, [])
+            )
+            self._by_canvas[canvas.id] = figures
+        return figures[region.id]
+
+    def placed(self, canvas: Canvas) -> None:
+        self._by_canvas.pop(canvas.id, None)
+
+
 @dataclass
 class _QueuedJob:
     """A queued drawing plus the inputs reused across every placement attempt.
@@ -404,26 +435,6 @@ class _QueuedJob:
     drawing: list[DrawingCommand]
     heading0: float
     native_span: float
-
-    _footprints: dict[float, canvas_engine.FootprintCache] = field(default_factory=dict)
-    """Rotated, rasterized footprints, keyed by the absolute scale they were built at.
-
-    A queued drawing is re-tested against every ready bot on every poll, and the
-    scales it gets tried at are deterministic (the target, then a fixed bisection),
-    so the same rotations get rasterized over and over. Keyed by absolute scale
-    rather than by region, so two regions that size a drawing the same way share the
-    work. Lives and dies with the job.
-    """
-
-    def footprints_at(
-        self, scale: float, strokes: Sequence[canvas_engine.Stroke]
-    ) -> canvas_engine.FootprintCache:
-        key = round(scale, 6)
-        cache = self._footprints.get(key)
-        if cache is None:
-            cache = canvas_engine.FootprintCache(strokes)
-            self._footprints[key] = cache
-        return cache
 
 
 @dataclass
@@ -658,17 +669,9 @@ class _Coordinator:
             self.insert_drawings(cfg.id, cfg.drawings)
 
     def insert_drawings(self, canvas_id: str, drawings: list[PlacedDrawing]) -> None:
-        if canvas_id not in self._drawings:
-            self._drawings[canvas_id] = []
-        for drawing in drawings:
-            self._drawings[canvas_id].append(drawing)
-            canvas = self._store.get(canvas_id)
-            if canvas is None:
-                return
-            region = canvas.region_for_robot(drawing.robot_name)
-            if region is None:
-                return
-            region.add_drawings([drawing])
+        # Recording them is all it takes: placement rebuilds each region's
+        # occupancy from this list, so they're reserved from the next search on.
+        self._drawings.setdefault(canvas_id, []).extend(drawings)
 
     def remove_canvas(self, canvas_id: str) -> None:
         with self._lock:
@@ -680,13 +683,8 @@ class _Coordinator:
             if canvas_id not in self._drawings:
                 raise KeyError(canvas_id)
             count = len(self._drawings[canvas_id])
+            # Emptying the record frees the space too: occupancy is derived from it.
             self._drawings[canvas_id] = []
-            # Also free the reserved space: without this the record goes empty but
-            # every region grid stays full, so nothing new can be placed.
-            canvas = self._store.get(canvas_id)
-            if canvas is not None:
-                for region in canvas.regions:
-                    region.clear()
             return count
 
     # -- enqueue (on approval) ---------------------------------------------- #
@@ -797,6 +795,7 @@ class _Coordinator:
     def snapshot(self) -> "RobotPool":
         now = time.monotonic()
         with self._lock:
+            free = _FreeFractions(self)
             bots = []
             for r in self._robots.values():
                 region = self._store.region_for_robot(r.name)
@@ -806,7 +805,7 @@ class _Coordinator:
                         status=r.status,
                         pose=r.pose,
                         region=region.id if region else None,
-                        regionFreeFraction=region.free_fraction if region else None,
+                        regionFreeFraction=free.for_robot(r.name),
                         idleSeconds=(now - r.ready_since) if r.ready_since else 0.0,
                         secondsSinceSeen=now - r.last_seen,
                         stagedJobId=r.staged.job.jobId if r.staged else None,
@@ -851,6 +850,37 @@ class _Coordinator:
         color = region.color if region is not None else "#FF0000"
         return color if color is not None else "#FF0000"
 
+    def free_fractions(self, canvas_id: str) -> dict[str, float]:
+        """How empty each region of ``canvas_id`` is, keyed by region id.
+
+        Raises ``KeyError`` for an unknown canvas."""
+        with self._lock:
+            canvas = self._store.get(canvas_id)
+            if canvas is None:
+                raise KeyError(canvas_id)
+            return canvas_engine.free_fractions(
+                canvas, self._drawings.get(canvas_id, [])
+            )
+
+    def occupancy(self, canvas_id: str, region_id: str) -> canvas_engine.Occupancy:
+        """The grids a placement in that region would be searched against right
+        now, robots mid-drawing included. For debugging and visualization.
+
+        Raises ``KeyError`` for an unknown canvas or region."""
+        with self._lock:
+            canvas = self._store.get(canvas_id)
+            if canvas is None:
+                raise KeyError(canvas_id)
+            region = next((r for r in canvas.regions if r.id == region_id), None)
+            if region is None:
+                raise KeyError(region_id)
+            return canvas_engine.occupancy(
+                canvas,
+                region,
+                self._drawings.get(canvas_id, []),
+                active=self.drawingDictionary,
+            )
+
     # -- internals ---------------------------------------------------------- #
 
     def scale_commands(self, commands, scale):
@@ -886,19 +916,24 @@ class _Coordinator:
         For each queued job we consider every ready bot that has a region and no
         job already staged, ranked best-first (most idle, then most canvas free),
         and run a placement search in that bot's region. The first bot whose
-        region can fit the drawing gets it: we reserve the footprint and stage the
-        resolved start pose for delivery on that bot's next check-in. Jobs that
-        currently fit nowhere stay queued (a region only fills up, so they wait
-        for a different ready bot — re-tried on every check-in).
+        region can fit the drawing gets it: we record the drawing (which reserves
+        its space for every later search) and stage the resolved start pose for
+        delivery on that bot's next check-in. Jobs that currently fit nowhere stay
+        queued (a region only fills up, so they wait for a different ready bot —
+        re-tried on every check-in).
+
+        Each search sees the canvas as it is at that moment — ``_drawings`` and
+        ``drawingDictionary`` — so a drawing placed earlier in this pass, and the
+        bot that will draw it, are already obstacles to the next one. Nothing is
+        cached across searches, so nothing needs invalidating.
 
         This runs inside the check-in lock, so it is on the critical path of every
-        robot's poll, and a placement search is not cheap — hundreds of ms on a
-        tight canvas, times the shrink-to-fit bisection, times each candidate bot.
-        Two budgets keep that bounded (see ``assign_budget_s``/``job_budget_s``):
-        the pass stops starting new work once it's out of time, and a job that eats
-        its own budget without placing goes to the *back* of the queue so it can't
-        starve everything behind it. Both are checked between units of work, so the
-        real ceiling is the budget plus whatever search was already running.
+        robot's poll. Two budgets keep it bounded (see ``assign_budget_s``/
+        ``job_budget_s``): the pass stops starting new work once it's out of time,
+        and a job that eats its own budget without placing goes to the *back* of
+        the queue so it can't starve everything behind it. Both are checked between
+        units of work, so the real ceiling is the budget plus whatever search was
+        already running.
         """
 
         if not self._queue:
@@ -906,46 +941,7 @@ class _Coordinator:
 
         started = time.monotonic()
         deadline = started + self.assign_budget_s
-
-        # One prepared snapshot per region, reused for every job and every candidate
-        # bot in this pass. Building it costs an occupancy dilation, an FFT and the
-        # neighbours' body sweep, and none of that depends on the drawing being
-        # placed. Keyed by canvas as well as region: region ids are only unique
-        # within their own canvas.
-        contexts: dict[tuple[str, str], canvas_engine.PlacementContext] = {}
-
-        def context_for(
-            region: Region, canvas: Canvas
-        ) -> canvas_engine.PlacementContext:
-            key = (canvas.id, region.id)
-            context = contexts.get(key)
-            if context is None:
-                context = region.prepare(
-                    general_buffer=canvas.general_buffer,
-                    canvas=canvas,
-                    active_drawings=self.drawingDictionary,
-                )
-                contexts[key] = context
-            return context
-
-        def invalidate(region: Region, canvas: Canvas) -> None:
-            """Drop the snapshots that committing into ``region`` just invalidated.
-
-            Exactly two kinds go stale, and nothing else:
-
-            1. ``region`` itself — it has new ink, so its occupancy moved.
-            2. Regions on this canvas that ``adjoins`` it — their occupancy folds in
-               the live bodies of robots next door, and the bot we just staged has
-               become one.
-
-            Everything else is untouched: a region that doesn't adjoin this one
-            can't see the new robot (``_active_robot_keepout`` gates on exactly that
-            predicate), and other canvases can't see it at all.
-            """
-            contexts.pop((canvas.id, region.id), None)
-            for other in canvas.regions:
-                if other.id != region.id and other.adjoins(region):
-                    contexts.pop((canvas.id, other.id), None)
+        free = _FreeFractions(self)  # for ranking candidate bots
 
         still_queued: deque[_QueuedJob] = deque()
         deferred: deque[_QueuedJob] = deque()  # blew their budget — go to the back
@@ -969,7 +965,7 @@ class _Coordinator:
             # (not ready, mid-draw, or regionless) the job simply stays queued.
             if qj.job.robotName is not None:
                 candidates = [r for r in candidates if r.name == qj.job.robotName]
-            candidates.sort(key=self._score, reverse=True)
+            candidates.sort(key=lambda r: self._score(r, free), reverse=True)
 
             for bot in candidates:
                 if time.monotonic() >= job_deadline:
@@ -984,12 +980,11 @@ class _Coordinator:
                 # rotates the ink for a tighter fit; that rotation rides on the
                 # approach heading, so the drawing commands are sent unchanged.
                 placement, scaled_commands = self._place_scaled(
-                    region, qj, context_for(region, canvas), deadline=job_deadline
+                    region, canvas, qj, deadline=job_deadline
                 )
                 if placement is None:
                     continue  # won't fit even at min scale — try another bot
 
-                region.commit(placement)
                 staged_angle = qj.heading0 + placement.angle_deg
 
                 _, navigateFrom = canvas_engine.commands_to_strokes_with_pose(
@@ -1023,6 +1018,9 @@ class _Coordinator:
                 )
                 exit_pose = compute_exit_pose(drawing_strokes, canvas.markers, region)
 
+                # Recording the drawing is what reserves its space, and marking the
+                # bot as drawing it makes it an obstacle to its neighbours — both
+                # from the very next search, including later in this pass.
                 self.add_drawing(
                     canvas.id,
                     qj.job.jobId,
@@ -1033,8 +1031,8 @@ class _Coordinator:
                     exit_pose,
                 )
                 self.drawingDictionary[bot.name] = drawing_strokes
+                free.placed(canvas)
 
-                invalidate(region, canvas)
                 placed = True
                 break
 
@@ -1057,116 +1055,65 @@ class _Coordinator:
         still_queued.extend(deferred)
         self._queue = still_queued
 
-    def _score(self, record: _RobotRecord) -> tuple[float, float]:
-        region = self._store.region_for_robot(record.name)
-        free = region.free_fraction if region else 0.0
+    def _score(
+        self, record: _RobotRecord, free: _FreeFractions
+    ) -> tuple[float, float]:
         idle = time.monotonic() - record.ready_since if record.ready_since else 0.0
-        return (idle, free)
+        return (idle, free.for_robot(record.name) or 0.0)
 
     def replay_to_world(
         self, commands, start_x: float, start_y: float, heading_deg: float
     ):
         """Mirror the robot: run the (lead-in-stripped) commands from the given start
         pose and return pen-down polylines in global mm. This deliberately re-derives
-        the ink from the wire message rather than peeking at the occupancy grid."""
-        local = canvas_engine.commands_to_strokes(
-            commands
-        )  # local frame, first ink at (0,0)
-        rad = math.radians(heading_deg)
-        cos_t, sin_t = math.cos(rad), math.sin(rad)
-        world = []
-        for stroke in local:
-            world.append(
-                [
-                    (
-                        px * cos_t - py * sin_t + start_x,
-                        px * sin_t + py * cos_t + start_y,
-                    )
-                    for px, py in stroke
-                ]
-            )
-        return world
+        the ink from the wire message, so the recorded strokes — which are what
+        reserve the drawing's space — are exactly what the bot draws."""
+        return canvas_engine.replay_to_world(commands, start_x, start_y, heading_deg)
 
     def _place_scaled(
         self,
         region: Region,
+        canvas: Canvas,
         qj: "_QueuedJob",
-        context: canvas_engine.PlacementContext,
         scale_tol: float = 0.02,
         max_iters: int = 12,
         deadline: Optional[float] = None,
     ) -> tuple[Optional[Placement], list]:
         """Place the drawing at this region's target footprint size, shrinking only
-        if it won't fit. Returns ``(placement, scaled_commands)``.
+        if it won't fit. Returns ``(placement, scaled_commands)``, or
+        ``(None, drawing)`` if even ``min_footprint_scale`` of the target won't fit
+        (the caller leaves the job queued rather than drawing an illegible speck).
 
-        ``context`` is the region's prepared snapshot (occupancy, its FFT, and the
-        live neighbours' bodies). It's passed in rather than built here because this
-        method runs up to ``max_iters + 1`` searches and every one of them would
-        otherwise rebuild it — none of it depends on the drawing or its scale. The
-        caller owns it, and must rebuild it whenever the region's ink or the live
-        drawings change.
-
-        The base scale ``target = target_footprint_mm / native_span`` sizes the
-        drawing (uniformly, so aspect ratio is kept and the longest side hits the
-        target) — it may scale up or down. We try that first; if it fits we're
-        done. Otherwise footprint-fits-region is monotonic in size, so we
-        binary-search a fraction ``s`` of the target in ``[min_footprint_scale, 1)``
-        for the largest that still places, and return ``(None, drawing)`` if even
-        ``min_footprint_scale * target`` won't fit (caller leaves the job queued
-        rather than drawing an illegible speck).
-
-        The loop stops once the scale interval is narrower than ``scale_tol``:
-        each step costs a full placement search, and refining below a couple of
-        percent moves the footprint less than an occupancy cell. ``max_iters`` is
-        a hard backstop.
+        One call into the engine (``canvas_engine.place``), which runs the whole
+        search: the target size first, then a bisection on the scale until it's
+        within ``scale_tol`` (``max_iters`` is a hard backstop). It sees every
+        drawing on the canvas and every robot drawing right now, as they are at
+        this moment.
 
         ``deadline`` (a ``time.monotonic`` stamp) stops the bisection early. The
         full-size attempt always runs — it's the common case and the reason we're
-        here — but the refinement is the expensive part and the most expendable:
-        giving up returns the best fit found so far, which is a real placement, just
-        possibly smaller than one more step would have found.
+        here — but the refinement is the expendable part: giving up returns the
+        best fit found so far, a real placement, just possibly smaller than one more
+        step would have found.
         """
-
-        if qj.native_span <= 0:
+        placement = canvas_engine.place(
+            canvas,
+            region,
+            self._drawings.get(canvas.id, []),
+            qj.drawing,
+            qj.heading0,
+            qj.native_span,
+            active=self.drawingDictionary,
+            # Drawn from the coordinator's own RNG, so a seeded coordinator
+            # places deterministically.
+            seed=self._rng.getrandbits(64),
+            budget_s=None if deadline is None else deadline - time.monotonic(),
+            scale_tol=scale_tol,
+            max_iters=max_iters,
+        )
+        if placement is None:
             return None, qj.drawing
-        min_scale = region.config.min_footprint_scale
-        target = region.config.target_footprint_mm / qj.native_span
-
-        def attempt(s: float) -> tuple[Optional[Placement], list]:
-            scale = target * s
-            commands = self.scale_commands(qj.drawing, scale)
-            strokes = self.replay_to_world(commands, 0, 0, qj.heading0)
-            return (
-                region.try_place(
-                    strokes,
-                    context,
-                    rng=self._rng,
-                    footprints=qj.footprints_at(scale, strokes),
-                ),
-                commands,
-            )
-
-        # Target size first (s = 1.0): the common case on a canvas with free space.
-        placement, commands = attempt(1.0)
-        if placement is not None:
-            return placement, commands
-
-        # Doesn't fit at target — shrink below it as little as possible.
-        lo, hi = min_scale, 1.0
-        best: Optional[Placement] = None
-        best_commands: list = qj.drawing
-        iters = 0
-        while hi - lo > scale_tol and iters < max_iters:
-            if deadline is not None and time.monotonic() >= deadline:
-                break  # out of time — keep the best fit we've already proved
-            iters += 1
-            mid = (lo + hi) / 2.0
-            placement, commands = attempt(mid)
-            if placement is not None:
-                best, best_commands, lo = placement, commands, mid  # fits → go bigger
-            else:
-                hi = mid  # too big → shrink the upper bound
-        return best, best_commands
+        return placement, self.scale_commands(qj.drawing, placement.scale)
 
     def add_drawing(
         self,
@@ -1408,7 +1355,7 @@ async def get_canvases(request: Request) -> Canvases:
                 ],
                 placement=placement,
                 drawings=list(drawings),
-                freeFractionByRegion={r.id: r.free_fraction for r in c.regions},
+                freeFractionByRegion=coordinator.free_fractions(c.id),
             )
         )
     return Canvases(canvases=items)

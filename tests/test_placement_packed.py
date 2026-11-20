@@ -2,9 +2,9 @@
 
 What this exercises
 -------------------
-The coordinator owns a per-region occupancy grid and, on every check-in, runs a
-placement search (rotation + offset) to fit a queued drawing into the free space
-that's left. This test drives that path end-to-end:
+The coordinator keeps the drawings placed on each canvas and, on every check-in,
+runs a placement search (rotation + offset) to fit a queued drawing into the free
+space they leave. This test drives that path end-to-end:
 
 1. **Pre-pack** a single-region canvas by enqueuing copies of the available
    vectorizations and draining them through ready check-ins, until the region is
@@ -220,8 +220,7 @@ def run_demo(
     os.makedirs(out_dir, exist_ok=True)
 
     coord = _Coordinator([_make_canvas(strategy, general_buffer)], seed=seed)
-    region = coord._store.region_for_robot(ROBOT)
-    assert region is not None
+    assert coord._store.region_for_robot(ROBOT) is not None
 
     # 1) Pre-pack: enqueue copies of the available vectorizations and drain them
     # through ready polls, one placement per poll, to fill the region.
@@ -256,6 +255,7 @@ def run_demo(
         elif resp.action == "wait":
             break
 
+    free = coord.free_fractions(CANVAS_ID)["full"]
     _render(
         os.path.join(
             out_dir,
@@ -267,7 +267,7 @@ def run_demo(
             f"[{strategy}] "
             f"buffer={general_buffer} "
             f"final: {len(_placed(coord))} drawings, "
-            f"free={region.free_fraction:.0%}"
+            f"free={free:.0%}"
         ),
     )
 
@@ -277,7 +277,7 @@ def run_demo(
         "prepacked": n_packed,
         "targets": len(vectorizations),
         "targets_placed": placed_targets,
-        "free_fraction": region.free_fraction,
+        "free_fraction": free,
     }
 
 
