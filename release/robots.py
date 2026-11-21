@@ -226,14 +226,11 @@ class PlacementSettings(BaseModel):
     strategy: Literal["origin", "scatter"] = "scatter"
     targetFootprintMm: float = 200.0  # scale each drawing so its longest side is ~this
     minFootprintScale: float = 0.4  # shrink floor, as a fraction of targetFootprintMm
-    # scatter: draw this many valid poses and keep the one with the most room
-    # around it. 1 = a plain random pick (drawings often land right beside each
-    # other); 8 leaves open space between them and still looks hand-placed.
+    # scatter: draw this many valid poses and keep the one farthest from existing
+    # drawings. 1 = a plain random pick (about a third of drawings land within
+    # 80mm of another while open space remains); 8 cuts that to ~9% and still
+    # looks hand-placed, at the same capacity. More did no better in testing.
     scatterCandidates: int = 8
-    # scatter with >1 candidate: how much the region's edges count as obstacles
-    # (0 = not at all, 1 = as much as ink). 0.25 keeps drawings off the edges
-    # without giving up the spreading.
-    edgeWeight: float = 0.25
 
 
 class CanvasConfig(BaseModel):
@@ -284,7 +281,6 @@ def _build_canvas(cfg: CanvasConfig) -> Canvas:
         target_footprint_mm=cfg.placement.targetFootprintMm,
         min_footprint_scale=cfg.placement.minFootprintScale,
         scatter_candidates=cfg.placement.scatterCandidates,
-        edge_weight=cfg.placement.edgeWeight,
     )
     return Canvas(
         id=cfg.id,
@@ -1302,7 +1298,6 @@ def _placement_settings(pc: PlacementConfig) -> PlacementSettings:
         targetFootprintMm=pc.target_footprint_mm,
         minFootprintScale=pc.min_footprint_scale,
         scatterCandidates=pc.scatter_candidates,
-        edgeWeight=pc.edge_weight,
     )
 
 

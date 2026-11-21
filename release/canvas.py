@@ -342,19 +342,11 @@ class PlacementConfig:
     """
 
     scatter_candidates: int = 8
-    """``scatter`` only: draw this many valid poses and keep the one with the most
-    room around it (best-candidate sampling). 1 is a plain uniform pick, under
+    """``scatter`` only: draw this many valid poses and keep the one farthest from
+    existing drawings (best-candidate sampling). 1 is a plain uniform pick, under
     which drawings often land right beside each other with open space elsewhere;
-    8 spreads them out while still looking hand-placed, at about the same
-    capacity when the canvas fills up.
-    """
-
-    edge_weight: float = 0.25
-    """``scatter`` with more than one candidate: how much the region's edges count
-    as obstacles when measuring that room — 0 not at all (drawings end up on the
-    edges as often as with a plain pick), 1 as much as ink (the edges dominate and
-    the spreading mostly vanishes). 0.25 keeps drawings off the edges and keeps
-    most of the spreading.
+    8 spreads them out while still looking hand-placed, at the same capacity
+    when the canvas fills up. The region's edges don't count as obstacles.
     """
 
 
@@ -518,7 +510,6 @@ def _canvas_spec(canvas: Canvas) -> dict:
                     "target_footprint_mm": r.config.target_footprint_mm,
                     "min_footprint_scale": r.config.min_footprint_scale,
                     "scatter_candidates": r.config.scatter_candidates,
-                    "edge_weight": r.config.edge_weight,
                 },
             }
             for r in canvas.regions
