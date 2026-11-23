@@ -154,12 +154,12 @@ def test_a_slow_job_does_not_starve_the_ones_behind_it():
     real = coord._place_scaled
     seen: list[str] = []
 
-    def slow_first(region, qj, context, *a, **k):
+    def slow_first(region, canvas, qj, *a, **k):
         if qj.job.jobId == ids[0]:
             seen.append(qj.job.jobId)
             time.sleep(0.05)
             return None, qj.drawing  # unplaceable
-        return real(region, qj, context, *a, **k)
+        return real(region, canvas, qj, *a, **k)
 
     coord._place_scaled = slow_first  # type: ignore[method-assign]
     coord.job_budget_s = 0.01  # the sleep alone exceeds this

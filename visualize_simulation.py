@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Programmatic visualization + verification of the server-side robot coordination.
 
-This exercises *only* the server logic — ``canvas.py`` (footprint rasterization,
-occupancy grids, rotation-aware placement) and ``robots.py`` (the coordinator's
-ready-pool matchmaking and lead-in stripping). The robots are **simulated**: no
+This exercises *only* the server logic — ``canvas.py`` and the placement engine
+behind it (occupancy, rotation-aware placement) and ``robots.py`` (the
+coordinator's ready-pool matchmaking and lead-in stripping). The robots are **simulated**: no
 hardware, no network. Each simulated bot runs the Poll → Draw loop against the
 real ``_Coordinator``, and we independently replay the drawing commands it
 receives to render exactly the ink it would put down — so the picture is a true
@@ -40,6 +40,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from release import canvas, robots  # noqa: E402
+from shapely.geometry import MultiLineString  # noqa: E402
 
 Line, Spin, Arc = robots.LineCommand, robots.SpinCommand, robots.ArcCommand
 
@@ -126,7 +127,7 @@ def make_doodle(rng: np.random.Generator, max_extent: float) -> list:
 def replay_to_world(commands, start_x: float, start_y: float, heading_deg: float):
     """Mirror the robot: run the (lead-in-stripped) commands from the given start
     pose and return pen-down polylines in global mm. This deliberately re-derives
-    the ink from the wire message rather than peeking at the occupancy grid."""
+    the ink from the wire message rather than trusting the server's records."""
     local = canvas.commands_to_strokes(commands)  # local frame, first ink at (0,0)
     rad = math.radians(heading_deg)
     cos_t, sin_t = math.cos(rad), math.sin(rad)
@@ -168,7 +169,7 @@ class Renderer:
     def _px(self, x: float, y: float) -> tuple[float, float]:
         return (self.margin + x * self.scale, self.margin + 28 + y * self.scale)
 
-    def frame(self, regions, drawings, tick: int, note: str) -> Image.Image:
+    def frame(self, regions, free: dict[str, float], drawings, tick: int, note: str) -> Image.Image:
         img = Image.new("RGB", (self.W, self.H), (250, 250, 248))
         d = ImageDraw.Draw(img)
 
@@ -177,7 +178,7 @@ class Renderer:
             x0, y0 = self._px(region.x, region.y)
             x1, y1 = self._px(region.x + region.width, region.y + region.height)
             d.rectangle([x0, y0, x1, y1], outline=(190, 190, 190), fill=(247, 247, 244))
-            label = f"{region.id} · {region.robot} · {int(round((1 - region.free_fraction) * 100))}% packed"
+            label = f"{region.id} · {region.robot} · {int(round((1 - free[region.id]) * 100))}% packed"
             d.text((x0 + 4, y0 + 3), label, fill=(120, 120, 120), font=self.font)
 
         # drawings — each doodle a distinct color so they're easy to isolate
@@ -262,7 +263,9 @@ def run(seed: int, num_bots: int, scale: float, out_dir: pathlib.Path) -> None:
 
     renderer = Renderer(scale=scale)
     drawings: list[tuple[int, list]] = []  # (bot_index, world_strokes)
-    frames: list[Image.Image] = [renderer.frame(regions, drawings, 0, "start")]
+    frames: list[Image.Image] = [
+        renderer.frame(regions, coord.free_fractions(store_canvas.id), drawings, 0, "start")
+    ]
 
     # simulated bot state: when each bot finishes its current drawing, and how
     # many ready-polls in a row it's been told to wait while work was available
@@ -318,14 +321,17 @@ def run(seed: int, num_bots: int, scale: float, out_dir: pathlib.Path) -> None:
             drawing[name] = True
             free_at[name] = tick + int(rng.integers(1, 3))  # draw for 1–2 ticks
 
-            # VERIFY: no cell is ever double-stamped (i.e. drawings never overlap)
-            assert all(
-                int(r.grid.max(initial=0)) <= 1 for r in regions
-            ), "occupancy overlap!"
+            # VERIFY: the new doodle's ink never touches an earlier one in its region
+            new_ink = MultiLineString([s for s in world if len(s) >= 2])
+            for b, other in drawings[:-1]:
+                if b == bot_index[name]:
+                    old_ink = MultiLineString([s for s in other if len(s) >= 2])
+                    assert new_ink.distance(old_ink) > 0, "doodles overlap!"
 
             frames.append(
                 renderer.frame(
                     regions,
+                    coord.free_fractions(store_canvas.id),
                     drawings,
                     tick,
                     f"{name} placed a doodle  ·  saturated regions: {saturated_count()}/{len(regions)}",
@@ -334,9 +340,11 @@ def run(seed: int, num_bots: int, scale: float, out_dir: pathlib.Path) -> None:
 
     # a closing frame that states the terminal condition (the per-placement
     # frames stop one or two ticks before the last region saturates)
+    free = coord.free_fractions(store_canvas.id)
     frames.append(
         renderer.frame(
             regions,
+            free,
             drawings,
             tick,
             f"all {num_bots} regions saturated — {len(drawings)} doodles, no overlaps",
@@ -344,17 +352,17 @@ def run(seed: int, num_bots: int, scale: float, out_dir: pathlib.Path) -> None:
     )
 
     # final summary + verification
-    overall_free = float(np.mean([r.free_fraction for r in regions]))
+    overall_free = float(np.mean([free[r.id] for r in regions]))
     print(f"Simulation finished after {tick} ticks — all {num_bots} regions saturated")
     print("(saturated = the placement search can no longer fit any queued doodle).")
     print(f"Total doodles placed: {len(drawings)}")
     for i, r in enumerate(regions):
         count = sum(1 for b, _ in drawings if b == i)
         print(
-            f"  region {r.id} (bot {r.robot}): {count} doodles, {(1 - r.free_fraction) * 100:5.1f}% packed"
+            f"  region {r.id} (bot {r.robot}): {count} doodles, {(1 - free[r.id]) * 100:5.1f}% packed"
         )
     print(f"Overall canvas {round((1 - overall_free) * 100, 1)}% packed.")
-    print("No-overlap check passed: every region grid max occupancy ≤ 1.")
+    print("No-overlap check passed: no doodle's ink touches another in its region.")
 
     # hold the last frame, then write outputs
     final = frames[-1]

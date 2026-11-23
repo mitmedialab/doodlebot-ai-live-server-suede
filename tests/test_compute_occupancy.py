@@ -1,13 +1,12 @@
-"""Visual + behavioural check of ``Region.compute_occupancy``.
+"""Visual + behavioural check of the ``general_buffer`` keep-out.
 
 What this exercises
 -------------------
-``compute_occupancy`` is the one thing standing between the committed grid (bare
-ink) and the keep-out map ``try_place`` tests against: it takes the grid, grows
-the occupied side by ``general_buffer`` mm, and crops back to the region's own
-bounds. This test builds a region with a handful of source drawings committed at
-known positions, then renders the occupancy map it produces at a range of
-buffers so the growth is inspectable:
+Between the committed ink and the keep-out map a placement is searched against,
+the engine grows the occupied side by the canvas's ``general_buffer`` mm and
+crops back to the region's own bounds. This test puts a handful of drawings on a
+region at known positions, then renders the engine's grids (``canvas.occupancy``)
+at a range of buffers so the growth is inspectable:
 
 * ``occupancy_buffer_NNN.png``  — the keep-out map on its own (black = keep out)
 * ``overlay_buffer_NNN.png``    — the same map (orange) with the committed ink
@@ -16,11 +15,11 @@ buffers so the growth is inspectable:
 
 Output lands in ``tests/output/compute_occupancy/``.
 
-The drawings are stamped at hand-picked positions rather than via ``try_place``
-so the layout is fixed and each interesting case is visible in isolation: two
-drawings sit close enough that their halos merge at the larger buffers, and the
-dot sits near the right edge so you can see the halo get cropped at the region
-bound instead of extending the region.
+The drawings sit at hand-picked positions rather than wherever the search would
+put them, so the layout is fixed and each interesting case is visible in
+isolation: two drawings sit close enough that their halos merge at the larger
+buffers, and the dot sits near the right edge so you can see the halo get cropped
+at the region bound instead of extending the region.
 
 Run it directly for the visuals (``python tests/test_compute_occupancy.py``) or
 under pytest (``pytest tests/test_compute_occupancy.py``). Both produce the PNGs.
@@ -32,6 +31,7 @@ import math
 import os
 import sys
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -44,11 +44,12 @@ if _REPO_ROOT not in sys.path:
 
 from release.canvas import (  # noqa: E402
     Canvas,
-    Placement,
+    Occupancy,
+    PlacedDrawing,
     PlacementConfig,
     Region,
     Stroke,
-    rasterize,
+    occupancy,
 )
 
 OUT_DIR = os.path.join(
@@ -58,6 +59,7 @@ OUT_DIR = os.path.join(
 REGION_W = 600.0
 REGION_H = 400.0
 CELL_MM = 2.0
+ROBOT = "bot1"
 
 # Buffers to render, in mm. 0 is the degenerate case (occupancy == bare ink); the
 # rest are large enough that the growth is obvious at this cell size, and 60 is
@@ -102,27 +104,53 @@ def _dot() -> list[Stroke]:
 # --------------------------------------------------------------------------- #
 
 
-def _make_region() -> Region:
+def _region() -> Region:
     return Region(
         id="occ",
         x=0.0,
         y=0.0,
         width=REGION_W,
         height=REGION_H,
-        robot="bot1",
+        robot=ROBOT,
         config=PlacementConfig(cell_mm=CELL_MM),
     )
 
 
-def _occupancy(region: Region, buffer: int) -> np.ndarray:
-    """``compute_occupancy`` with the neighbouring-robot machinery sat out.
+def _at(strokes: list[Stroke], at_mm: tuple[float, float]) -> PlacedDrawing:
+    """A drawing already on the canvas, with its local origin at ``at_mm``.
 
-    That path needs the containing canvas (to resolve which region each active
-    robot draws in) and the active-drawing dict; this file is about the
-    ``general_buffer`` growth in isolation, so we hand it a canvas holding only
-    this region and nobody drawing. ``tests/test_active_robot_keepout.py`` covers
-    the other half.
+    Only the strokes matter to the engine: it reserves each drawing's ink in its
+    robot's region, wherever that ink is.
     """
+    ax, ay = at_mm
+    return PlacedDrawing(
+        job_id=f"at_{ax:g}_{ay:g}",
+        robot_name=ROBOT,
+        anchor_x=ax,
+        anchor_y=ay,
+        angle_deg=0.0,
+        commands=[],
+        strokes=[[(x + ax, y + ay) for x, y in s] for s in strokes],
+        exit_pose_x=0.0,
+        exit_pose_y=0.0,
+        exit_pose_deg=0.0,
+    )
+
+
+POPULATED: list[PlacedDrawing] = [
+    _at(_square(90.0), (60.0, 60.0)),
+    _at(_circle(45.0), (230.0, 50.0)),  # near the square: halos merge at 60mm
+    _at(_zigzag(180.0, 70.0), (80.0, 260.0)),
+    _at(_dot(), (560.0, 200.0)),  # near the right edge: halo gets cropped
+]
+
+
+def _occupancy(drawings: list[PlacedDrawing], buffer: int) -> Occupancy:
+    """The engine's grids for the region, with nobody drawing next door.
+
+    ``tests/test_active_robot_keepout.py`` covers the live-robot half.
+    """
+    region = _region()
     canvas = Canvas(
         id="occ-canvas",
         width=REGION_W,
@@ -130,57 +158,19 @@ def _occupancy(region: Region, buffer: int) -> np.ndarray:
         general_buffer=buffer,
         regions=[region],
     )
-    return region.compute_occupancy(
-        general_buffer=buffer, canvas=canvas, active_drawings={}
-    )
+    return occupancy(canvas, region, drawings)
 
 
-def _half_width_cells(config: PlacementConfig) -> int:
-    """The ink half-thickness ``try_place`` rasterizes at: pen radius + clearance."""
-    return int(math.ceil((config.pen_mm / 2.0 + config.clearance_mm) / config.cell_mm))
-
-
-def _stamp(region: Region, strokes: list[Stroke], at_mm: tuple[float, float]) -> None:
-    """Commit ``strokes`` with their local origin at ``at_mm`` in the region frame.
-
-    Goes through the real ``Region.commit`` (via a hand-built ``Placement``) so the
-    grid we hand to ``compute_occupancy`` is stamped exactly the way a placed
-    drawing stamps it — we're only choosing the pose ourselves instead of letting
-    the search pick it.
-    """
-    footprint = rasterize(
-        strokes, region.config.cell_mm, _half_width_cells(region.config)
-    )
-    # ``_top``/``_left`` are the grid cell the mask's own (0,0) lands on; the mask
-    # carries ``pad`` cells of margin before the strokes' min corner.
-    left = int(round(at_mm[0] / region.config.cell_mm)) - footprint.pad
-    top = int(round(at_mm[1] / region.config.cell_mm)) - footprint.pad
-    mh, mw = footprint.mask.shape
-    rows, cols = region.grid.shape
-    assert 0 <= top and top + mh <= rows and 0 <= left and left + mw <= cols, (
-        f"stamp at {at_mm} would fall outside the region grid "
-        f"(mask {mh}x{mw} at top={top} left={left}, grid {rows}x{cols})"
-    )
-    region.commit(
-        Placement(
-            angle_deg=0.0,
-            anchor_x=region.x + at_mm[0],
-            anchor_y=region.y + at_mm[1],
-            _top=top,
-            _left=left,
-            _footprint=footprint,
-        )
-    )
-
-
-def _populated_region() -> Region:
-    """A region with four source drawings committed at fixed, hand-picked poses."""
-    region = _make_region()
-    _stamp(region, _square(90.0), (60.0, 60.0))
-    _stamp(region, _circle(45.0), (230.0, 50.0))  # near the square: halos merge at 60mm
-    _stamp(region, _zigzag(180.0, 70.0), (80.0, 260.0))
-    _stamp(region, _dot(), (560.0, 200.0))  # near the right edge: halo gets cropped
-    return region
+def _cv2_buffer(ink: np.ndarray, buffer_mm: float) -> np.ndarray:
+    """Reference: ``ink`` dilated by OpenCV's elliptical kernel of radius
+    ``ceil(buffer / cell)``, with nothing outside the region contributing."""
+    radius = math.ceil(buffer_mm / CELL_MM)
+    if radius == 0:
+        return ink.copy()
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    padded = np.pad(ink.astype(np.uint8), radius)
+    grown = cv2.dilate(padded, kernel).astype(bool)
+    return grown[radius:-radius, radius:-radius]
 
 
 # --------------------------------------------------------------------------- #
@@ -194,22 +184,21 @@ def _upscale(img: Image.Image) -> Image.Image:
     )
 
 
-def _render_occupancy(path: str, occupancy: np.ndarray) -> None:
+def _render_occupancy(path: str, keepout: np.ndarray) -> None:
     """The keep-out map on its own: black = keep out, white = free."""
-    arr = (255 - occupancy.astype(np.uint8) * 255).astype(np.uint8)
+    arr = (255 - keepout.astype(np.uint8) * 255).astype(np.uint8)
     _upscale(Image.fromarray(arr, mode="L")).save(path)
 
 
-def _render_overlay(path: str, region: Region, occupancy: np.ndarray) -> None:
+def _render_overlay(path: str, occ: Occupancy) -> None:
     """The keep-out map (orange) with the committed ink (black) drawn back on top.
 
     Anything orange is space the buffer reserved but no pen ever touches — that
     gap is the whole point of ``general_buffer``.
     """
-    ink = region.grid.astype(bool)
-    rgb = np.full(ink.shape + (3,), 255, dtype=np.uint8)
-    rgb[occupancy] = (255, 176, 80)  # keep-out grown from the ink
-    rgb[ink] = (20, 20, 20)  # the ink itself
+    rgb = np.full(occ.ink.shape + (3,), 255, dtype=np.uint8)
+    rgb[occ.keepout] = (255, 176, 80)  # keep-out grown from the ink
+    rgb[occ.ink] = (20, 20, 20)  # the ink itself
     _upscale(Image.fromarray(rgb, mode="RGB")).save(path)
 
 
@@ -220,20 +209,19 @@ def _render_overlay(path: str, region: Region, occupancy: np.ndarray) -> None:
 
 def run_demo() -> dict:
     os.makedirs(OUT_DIR, exist_ok=True)
-    region = _populated_region()
 
-    ink_cells = int(region.grid.sum())
+    ink_cells = int(_occupancy(POPULATED, 0).ink.sum())
     rendered: list[dict] = []
     for buffer in BUFFERS:
-        occupancy = _occupancy(region, buffer)
+        occ = _occupancy(POPULATED, buffer)
         occ_path = os.path.join(OUT_DIR, f"occupancy_buffer_{buffer:03d}.png")
         overlay_path = os.path.join(OUT_DIR, f"overlay_buffer_{buffer:03d}.png")
-        _render_occupancy(occ_path, occupancy)
-        _render_overlay(overlay_path, region, occupancy)
+        _render_occupancy(occ_path, occ.keepout)
+        _render_overlay(overlay_path, occ)
         rendered.append(
             {
                 "buffer": buffer,
-                "occupied_cells": int(occupancy.sum()),
+                "occupied_cells": int(occ.keepout.sum()),
                 "occupancy_png": occ_path,
                 "overlay_png": overlay_path,
             }
@@ -250,12 +238,12 @@ def run_demo() -> dict:
 def test_renders_occupancy_for_source_drawings():
     """The visual harness: renders the map at every buffer and sanity-checks it."""
     result = run_demo()
-    assert result["ink_cells"] > 0, "no ink was committed — nothing to buffer"
+    assert result["ink_cells"] > 0, "no ink was reserved — nothing to buffer"
 
     by_buffer = {f["buffer"]: f for f in result["frames"]}
     assert (
         by_buffer[0]["occupied_cells"] == result["ink_cells"]
-    ), "a zero buffer must leave the grid alone"
+    ), "a zero buffer must leave the ink alone"
 
     # Every frame exists, and each larger buffer keeps out strictly more space.
     counts = [by_buffer[b]["occupied_cells"] for b in BUFFERS]
@@ -265,89 +253,75 @@ def test_renders_occupancy_for_source_drawings():
         assert os.path.exists(frame["overlay_png"]), frame
 
 
-def test_zero_buffer_is_the_bare_grid():
+def test_drawings_are_reserved_where_their_ink_is():
+    """Every pen-down point lies in an ink cell — the reservation sits on the
+    drawing, not offset from it."""
+    ink = _occupancy(POPULATED, 0).ink
+    for drawing in POPULATED:
+        for stroke in drawing.strokes:
+            for x, y in stroke:
+                assert ink[int(y // CELL_MM), int(x // CELL_MM)], (
+                    f"{drawing.job_id}: ink at ({x:.0f}, {y:.0f}) is not reserved"
+                )
+
+
+def test_zero_buffer_is_the_bare_ink():
     """No buffer -> the keep-out map is exactly the committed ink."""
-    region = _populated_region()
-    occupancy = _occupancy(region, 0)
-    assert occupancy.dtype == np.bool_
-    assert occupancy.shape == region.grid.shape
-    np.testing.assert_array_equal(occupancy, region.grid.astype(bool))
+    occ = _occupancy(POPULATED, 0)
+    assert occ.keepout.dtype == np.bool_
+    assert occ.keepout.shape == (int(REGION_H / CELL_MM), int(REGION_W / CELL_MM))
+    np.testing.assert_array_equal(occ.keepout, occ.ink)
 
 
 def test_empty_region_is_entirely_free():
-    """Nothing committed -> nothing to grow, at any buffer."""
-    region = _make_region()
+    """Nothing on the canvas -> nothing to grow, at any buffer."""
     for buffer in BUFFERS:
-        occupancy = _occupancy(region, buffer)
-        assert occupancy.shape == region.grid.shape
-        assert not occupancy.any(), f"empty region claimed occupancy at buffer {buffer}"
+        assert not _occupancy([], buffer).keepout.any(), (
+            f"empty region claimed occupancy at buffer {buffer}"
+        )
 
 
 def test_buffer_only_ever_grows_the_ink():
     """The map is a superset of the ink, and monotonic in the buffer."""
-    region = _populated_region()
-    ink = region.grid.astype(bool)
-
+    ink = _occupancy(POPULATED, 0).ink
     previous = ink
     for buffer in BUFFERS:
-        occupancy = _occupancy(region, buffer)
-        assert occupancy.shape == region.grid.shape
-        assert np.all(occupancy[ink]), f"buffer {buffer} un-occupied committed ink"
+        keepout = _occupancy(POPULATED, buffer).keepout
+        assert np.all(keepout[ink]), f"buffer {buffer} un-occupied committed ink"
         assert np.all(
-            occupancy[previous]
+            keepout[previous]
         ), f"buffer {buffer} freed space a smaller buffer kept out"
-        previous = occupancy
-
-    # The grid itself is untouched — compute_occupancy snapshots, it doesn't mutate.
-    np.testing.assert_array_equal(region.grid.astype(bool), ink)
+        previous = keepout
 
 
-def test_buffer_grows_ink_by_the_kernel_radius():
-    """One isolated cell of ink dilates to exactly the elliptical kernel.
-
-    This pins the actual contract: the buffer is ``ceil(general_buffer / cell_mm)``
-    cells of clearance in every direction, not an approximation of it.
-    """
-    region = _make_region()
-    row, col = 100, 150
-    region.grid[row, col] = 1
-
-    buffer_mm = 20
-    radius = math.ceil(buffer_mm / CELL_MM)
-    occupancy = _occupancy(region, buffer_mm)
-
-    halo = occupancy[row - radius : row + radius + 1, col - radius : col + radius + 1]
-    # cv2's MORPH_ELLIPSE of this size is what compute_occupancy dilates with, so a
-    # single cell must reproduce it exactly.
-    import cv2
-
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)
-    ).astype(bool)
-    np.testing.assert_array_equal(halo, kernel)
-    # ...and nothing outside that neighbourhood is claimed.
-    assert int(occupancy.sum()) == int(kernel.sum())
+def test_buffer_is_exactly_the_elliptical_dilation():
+    """The contract, pinned exactly: the buffer is the ink dilated by OpenCV's
+    ``MORPH_ELLIPSE`` of radius ``ceil(general_buffer / cell_mm)`` cells — not an
+    approximation of it — for real shapes and for every buffer."""
+    for buffer in BUFFERS + (7, 33):
+        occ = _occupancy(POPULATED, buffer)
+        np.testing.assert_array_equal(
+            occ.buffered, _cv2_buffer(occ.ink, buffer), err_msg=f"buffer={buffer}mm"
+        )
 
 
 def test_halo_is_cropped_at_the_region_bounds():
     """Ink near an edge buffers up to the bound, and no further — the buffer pushes
     drawings apart, it doesn't extend the region."""
-    region = _make_region()
-    rows, cols = region.grid.shape
-    region.grid[rows - 1, cols - 1] = 1  # bottom-right corner cell
-
-    occupancy = _occupancy(region, 40)
-    assert occupancy.shape == region.grid.shape
-    assert occupancy[rows - 1, cols - 1]
-    # A corner keeps out only the quarter of its halo that lands inside the region.
+    corner = [_at(_dot(), (REGION_W - 1.0, REGION_H - 1.0))]  # bottom-right corner
+    occ = _occupancy(corner, 40)
+    rows, cols = occ.ink.shape
+    assert occ.ink[rows - 1, cols - 1], "the dot should land in the corner cell"
+    np.testing.assert_array_equal(occ.buffered, _cv2_buffer(occ.ink, 40))
+    # A corner keeps out only the quarter of its halo that lands inside.
+    ink_rows = np.where(occ.ink.any(axis=1))[0]
     radius = math.ceil(40 / CELL_MM)
-    assert occupancy[rows - 1 - radius, cols - 1], "halo did not reach the full radius"
-    assert not occupancy[: rows - 1 - radius, :].any(), "halo reached past its radius"
+    assert not occ.buffered[: ink_rows[0] - radius, :].any(), "halo reached past its radius"
 
 
 if __name__ == "__main__":
     summary = run_demo()
-    print(f"ink cells committed: {summary['ink_cells']}")
+    print(f"ink cells reserved: {summary['ink_cells']}")
     for frame in summary["frames"]:
         grown = frame["occupied_cells"] - summary["ink_cells"]
         print(

@@ -210,6 +210,8 @@ def _render_tick(path: str, tick: int, coord: _Coordinator, bots: dict[str, BotS
         return [b for b in bots.values() if b.info.canvas_id == canvas_id]
 
     for c, ox, oy, pw, ph in panels:
+        free = coord.free_fractions(c.id)
+
         def to_px(mx: float, my: float) -> tuple[float, float]:
             return (ox + mx * scale, oy + my * scale)
 
@@ -227,7 +229,7 @@ def _render_tick(path: str, tick: int, coord: _Coordinator, bots: dict[str, BotS
             label = f"{r.robot} [{bot.badge}]" if bot else r.robot
             lx, ly = to_px(r.x + 4, r.y + 4)
             d.text((lx, ly), label, fill=col)
-            d.text((lx, ly + 12), f"free {r.free_fraction:.0%}", fill=(150, 150, 150))
+            d.text((lx, ly + 12), f"free {free[r.id]:.0%}", fill=(150, 150, 150))
 
         # committed drawings, coloured by the robot that made them
         for dr in coord._drawings.get(c.id, []):
@@ -265,11 +267,9 @@ def _render_tick(path: str, tick: int, coord: _Coordinator, bots: dict[str, BotS
     img.save(path)
 
 
-def _render_occupancy(path: str, region) -> None:
-    import numpy as np
-
-    grid = np.asarray(region.grid)
-    arr = (255 - (grid > 0).astype("uint8") * 255).astype("uint8")
+def _render_occupancy(path: str, coord: _Coordinator, canvas_id: str, region_id: str) -> None:
+    ink = coord.occupancy(canvas_id, region_id).ink
+    arr = (255 - ink.astype("uint8") * 255).astype("uint8")
     Image.fromarray(arr, mode="L").resize(
         (arr.shape[1] * 2, arr.shape[0] * 2), Image.NEAREST
     ).save(path)
@@ -363,7 +363,7 @@ def run_sim(strategy: str = "scatter", seed: int = 0) -> dict:
     for c in coord.canvases():
         for r in c.regions:
             _render_occupancy(
-                os.path.join(out_dir, f"occupancy_{c.id}_{r.id}.png"), r
+                os.path.join(out_dir, f"occupancy_{c.id}_{r.id}.png"), coord, c.id, r.id
             )
 
     checks = _run_checks(coord, robot_info, enqueued)

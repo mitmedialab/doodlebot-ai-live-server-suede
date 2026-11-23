@@ -84,8 +84,10 @@ There is **no database**. State lives in two places:
    `combined/`. Custom presets persist to `presets.json`. These dirs are
    bind-mounted as Docker volumes so they survive restarts.
 2. **In-memory** — the SSE listener list (`common.py`) and the robot
-   coordinator's canvas occupancy grids + job queue (`robots.py`). These reset on
-   restart, which is fine: they model the *current* live session.
+   coordinator's placed drawings + job queue (`robots.py`). These reset on
+   restart, which is fine: they model the *current* live session. (Drawings can be
+   loaded back with `POST /api/robots/canvases`; their space is reserved from the
+   next placement on.)
 
 ### Auth
 
@@ -138,45 +140,59 @@ canvas model**, not the bots.
 Thread-safe matchmaker between a **job queue** and the **ready-bot pool**.
 
 - `enqueue_drawing(commands, …)` — called after a combined sketch is vectorized.
-  It pre-computes placement inputs once (turtle-integrated strokes, lead-in
-  split, a memoizing `FootprintCache`) and queues the job.
+  It pre-computes placement inputs once (lead-in split, start heading, the ink's
+  native size) and queues the job.
 - On every enqueue **and** every check-in, `_assign_locked()` tries to place each
   queued job. For each job it ranks ready bots (most idle, then most free canvas)
-  and runs a placement search in that bot's region. First fit wins: it reserves
-  the footprint in that region's occupancy grid and **stages** the resolved start
-  pose for delivery on the bot's next check-in. Jobs that fit nowhere stay queued
-  and are retried later (a region only ever fills up).
+  and runs a placement search in that bot's region. First fit wins: it records the
+  drawing on the canvas — which is what reserves its space — and **stages** the
+  resolved start pose for delivery on the bot's next check-in. Jobs that fit
+  nowhere stay queued and are retried later (a region only ever fills up).
 
 Each robot is assigned exactly one **region** of a canvas (one region = one bot's
 private area), configured via `DEFAULT_CANVASES` or `POST /api/robots/canvases`.
 
 ### Placement engine (`canvas.py`) — collision-free packing
 
-Pure geometry + numpy/PIL, no web deps. The flow:
+The search runs in
+[`canvas_placement`](https://github.com/mitmedialab/suede.canvas-placement), a
+Rust (PyO3) engine; `canvas.py` holds the canvas data model, the turtle geometry,
+and three thin wrappers around it: `place`, `free_fractions` and `occupancy`.
 
-1. **Commands → strokes** (`commands_to_strokes`): turtle-integrate
-   `line`/`spin`/`arc` commands into pen-down polylines in local mm.
-2. **Strip lead-in** (`split_lead_in`): drop the initial pen-up "drive to the
-   first ink" so placement only constrains the actual drawing. Rotation is free
-   for a turtle path — rotating the ink just rides on the bot's approach heading,
-   so the drawing commands are sent **unchanged**.
-3. **Rasterize → footprint** (`rasterize`): draw the strokes into a small boolean
-   mask, dilated by `pen_width/2 + clearance` so the keep-out buffer is baked in.
-4. **Search** (`Region.try_place`): for each candidate rotation, compute the full
-   map of collision-free offsets in one shot via **FFT cross-correlation**
-   against the region's occupancy grid (`_free_offsets`), then pick a pose by
-   strategy — `bottom_left` (dense, packs toward the corner) or `scatter`
-   (random valid pose, organic spread). `FootprintCache` memoizes the
-   rotate+rasterize across the many attempts a queued job makes.
-5. **Commit** (`Region.commit`): OR the footprint mask into the occupancy grid,
-   permanently reserving that space.
+The engine is **stateless**: every call rebuilds a region's occupancy from the
+canvas's list of placed drawings (`_Coordinator._drawings`), so that list is the
+only record of what space is taken. Recording a drawing reserves it; clearing the
+list frees it. Nothing else to keep in sync. The flow:
 
-Occupancy is a per-region `uint8` raster grid (~2 mm cells), the robotics-standard
-representation. `Region.free_fraction` exposes live fill for the admin view.
+1. **Strip lead-in** (`split_lead_in`, at enqueue): drop the initial pen-up "drive
+   to the first ink" so placement only constrains the actual drawing. Rotation is
+   free for a turtle path — rotating the ink just rides on the bot's approach
+   heading, so the drawing commands are sent **unchanged**.
+2. **Occupancy** (engine): rasterize every drawing in the region (cells within
+   `pen_width/2 + clearance` of the ink), grow it by the canvas's
+   `general_buffer`, and block what neighbouring robots that are drawing right now
+   sweep with their chassis.
+3. **Search** (engine): for each candidate rotation, get every collision-free
+   offset in one shot via **FFT cross-correlation**, then pick a pose by strategy —
+   `origin` (dense, packs toward the corner) or `scatter` (random valid pose,
+   organic spread; seeded from the coordinator's RNG). Near a live robot, a pose
+   must also pass an exact check of our own chassis sweep.
+4. **Size** (engine): try the canvas's `targetFootprintMm` first, then shrink as
+   little as needed (down to `minFootprintScale`).
 
-> Extension point: `try_place`'s `bottom_left` ranking is a simple heuristic. For
-> tighter packing, swap in a contact-point or No-Fit-Polygon score — the rest of
-> the pipeline is unchanged. (See the docstring in `canvas.py`.)
+`coordinator.free_fractions(canvas_id)` gives each region's fill for the admin
+view; `coordinator.occupancy(canvas_id, region_id)` returns the grids a search
+would see, for debugging. `python bench_placement.py --against main` (repo root)
+times placement against another branch.
+
+Like the vectorizer, the extension isn't on PyPI: `pyproject.toml` pins each
+platform's prebuilt wheel by release URL + sha256. To upgrade, swap the version +
+hashes for a newer
+[release](https://github.com/mitmedialab/suede.canvas-placement/releases).
+
+> Extension point: the `origin` ranking is a simple heuristic. For tighter
+> packing, swap in a contact-point or No-Fit-Polygon score — in the engine's
+> search step; the rest of the pipeline is unchanged.
 
 ---
 

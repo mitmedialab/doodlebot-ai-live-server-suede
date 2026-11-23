@@ -83,6 +83,11 @@ dependencies = [
     "arcline-vectorize @ https://github.com/pmalacho-mit/suede.doodlebot-vectorize/releases/download/v0.1.0/arcline_vectorize-0.1.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl#sha256=c8d7ab211c2a70abbc4ce6dc5f49ad22d04f7ab47d364afb1a141c50581ddd32 ; sys_platform == \"linux\" and platform_machine == \"x86_64\"",
     "arcline-vectorize @ https://github.com/pmalacho-mit/suede.doodlebot-vectorize/releases/download/v0.1.0/arcline_vectorize-0.1.0-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl#sha256=491d4604e199c8e1fbdf580e02e265676f2a1deabe6c4fe28eb7968f083ec5ba ; sys_platform == \"linux\" and platform_machine == \"aarch64\"",
     "arcline-vectorize @ https://github.com/pmalacho-mit/suede.doodlebot-vectorize/releases/download/v0.1.0/arcline_vectorize-0.1.0-cp39-abi3-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl#sha256=b8809f65df1ef0103924105fb764456f9507154eb211b2498b474d978cc02620 ; sys_platform == \"darwin\"",
+    # Rust drawing-placement engine (replaces the numpy/PIL engine in canvas.py).
+    # Same deal: not on PyPI, each platform's prebuilt abi3 wheel pinned by URL + sha256.
+    "canvas-placement @ https://github.com/mitmedialab/suede.canvas-placement/releases/download/v0.2.0/canvas_placement-0.2.0-cp311-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl#sha256=ea2a3b2ffa8dad447989db05dc748a33c20f0e74e6902d32e60ff9735182c0e4 ; sys_platform == \"linux\" and platform_machine == \"x86_64\"",
+    "canvas-placement @ https://github.com/mitmedialab/suede.canvas-placement/releases/download/v0.2.0/canvas_placement-0.2.0-cp311-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl#sha256=c9c7e23a76a92d571bc989d116c23753bbdd053ff9d9a49688f975b503ec62ee ; sys_platform == \"linux\" and platform_machine == \"aarch64\"",
+    "canvas-placement @ https://github.com/mitmedialab/suede.canvas-placement/releases/download/v0.2.0/canvas_placement-0.2.0-cp311-abi3-macosx_10_12_universal2.macosx_10_12_x86_64.macosx_11_0_arm64.whl#sha256=f2251030e4493ac77e2927fe4930e88947b4a0b61c6511625352d5526c141c24 ; sys_platform == \"darwin\"",
 ]
 
 [tool.setuptools]
